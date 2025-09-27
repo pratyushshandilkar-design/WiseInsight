@@ -1,0 +1,9 @@
+streamlit==1.35.0
+pandas==2.2.2
+numpy==1.26.4
+prophet==1.1.5
+plotly==5.20.0
+holidays==0.45
+statsmodels==0.14.1
+scikit-learn==1.4.2
+openpyxl==3.1.2
