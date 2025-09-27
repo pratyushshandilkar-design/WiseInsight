@@ -7,3 +7,4 @@ holidays
 statsmodels
 scikit-learn
 openpyxl
+xlsxwriter
