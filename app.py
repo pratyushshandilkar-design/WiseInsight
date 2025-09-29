@@ -1,26 +1,26 @@
 # ==============================================================================
-# UNIFIED FORECAST ENGINE - WISEINSIGHTS (FINAL POLISHED VERSION)
+# UNIFIED WFM PLATFORM - WISE INSIGHTS (v4.0 - Database Integration)
 # ==============================================================================
-# This application combines two separate forecasting tools into a single,
-# professional web application with a secure login page.
-#
-# MODIFIED: Fixed AttributeError, changed background to white,
-# added spinners for long processes, and restyled upload sections.
+# This application provides Forecasting and Capacity Planning tools,
+# secured with a granular, role-based access control system.
 # ==============================================================================
 
 # --- SECTION 1: UNIVERSAL LIBRARY IMPORTS ---
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from io import BytesIO
-import itertools
 import warnings
-import logging
+import math
 import os
-import zipfile
-import shutil
 import time
+import zipfile
+import sqlite3
+import bcrypt
+import json
+from io import BytesIO
+from datetime import datetime, timedelta
+from contextlib import contextmanager
+import json
 
 # Machine Learning and Time Series Libraries
 from prophet import Prophet
@@ -31,34 +31,66 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.seasonal import seasonal_decompose
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
+from ortools.sat.python import cp_model
+from sklearn.metrics import mean_absolute_error
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
 
 
 # --- SECTION 2: GLOBAL CONFIGURATION & UTILITIES ---
 
 st.set_page_config(
     page_title="WiseInsights",
-    page_icon="https://d21buns5ku92am.cloudfront.net/69645/images/470451-Frame%2039321-0745ed-medium-1677657684.png",
+    page_icon="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTT1PWyhOO0xEnxEPJ5ReTNTreJpAoOEJo6Tg&s",
     layout="wide"
 )
 
+# Define a constant for the archive directory path
+SHRINK_ARCHIVE_DIR = 'shrinkage_archive'
+
 warnings.filterwarnings("ignore")
-logging.basicConfig(level=logging.WARNING)
+# MODIFIED: Add a new table to your database creation function
+def create_db_tables():
+    """Creates all necessary tables for users, runs, and capacity plans."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        # ... (your existing users and runs tables are unchanged) ...
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, role TEXT NOT NULL,
+                can_view_shrinkage INTEGER NOT NULL, can_view_volume INTEGER NOT NULL,
+                can_view_capacity INTEGER NOT NULL, can_manage_schedules INTEGER NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, job_type TEXT NOT NULL,
+                job_run_by TEXT NOT NULL, timestamp TEXT NOT NULL,
+                status TEXT NOT NULL, details TEXT
+            )
+        ''')
+        
+        # NEW: Table to store saved capacity plans
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS capacity_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_name TEXT NOT NULL UNIQUE,
+                queues TEXT NOT NULL,
+                start_month TEXT NOT NULL,
+                saved_by TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                plan_data TEXT NOT NULL -- Stores input data as a JSON string
+            )
+        ''')
+        conn.commit()
 
 def to_excel_bytes(data, index=True):
-    """Converts a DataFrame or a dictionary of DataFrames into Excel format as bytes."""
+    """Converts a DataFrame into Excel format as bytes."""
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        if isinstance(data, dict):
-            for sheet_name, df in data.items():
-                df.to_excel(writer, index=index, sheet_name=sheet_name)
-        else:
-            df_to_save = data
-            if isinstance(df_to_save.columns, pd.MultiIndex):
-                df_to_save = df_to_save.copy()
-                df_to_save.columns = ['_'.join(map(str, col)).strip() for col in df_to_save.columns.values]
-            df_to_save.to_excel(writer, index=index, sheet_name="Sheet1")
+        data.to_excel(writer, index=index, sheet_name="Sheet1")
     return output.getvalue()
-
 
 def get_significance_rating(metric_value, metric_type='wmape'):
     """Returns a rating string based on an error metric's value."""
@@ -74,73 +106,194 @@ def get_significance_rating(metric_value, metric_type='wmape'):
         else: return "⚠️ Needs Review"
     return "N/A"
 
-# --- SECTION 3: LOGIN, SESSION STATE, AND MAIN UI STRUCTURE ---
+# --- SECTION 3: DATABASE MANAGEMENT & AUTHENTICATION HELPER FUNCTIONS ---
+DATABASE_NAME = 'wiseinsights_db.db'
+
+@contextmanager
+def get_db_connection():
+    """Provides a context-managed database connection."""
+    conn = sqlite3.connect(DATABASE_NAME)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def create_db_tables():
+    """Creates all necessary tables for users, runs, and capacity plans."""
+    print("Attempting to create database tables...")
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, role TEXT NOT NULL,
+                    can_view_shrinkage INTEGER NOT NULL, can_view_volume INTEGER NOT NULL,
+                    can_view_capacity INTEGER NOT NULL, can_manage_schedules INTEGER NOT NULL
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, job_type TEXT NOT NULL,
+                    job_run_by TEXT NOT NULL, timestamp TEXT NOT NULL,
+                    status TEXT NOT NULL, details TEXT
+                )
+            ''')
+            
+            # Table to store saved capacity plans
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS capacity_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    plan_name TEXT NOT NULL UNIQUE,
+                    queues TEXT NOT NULL,
+                    start_month TEXT NOT NULL,
+                    saved_by TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    plan_data TEXT NOT NULL -- Stores input data as a JSON string
+                )
+            ''')
+            conn.commit()
+            print("Database tables created successfully.")
+    except Exception as e:
+        print(f"Error creating database tables: {e}")
+
+def add_user(username, password, role, permissions):
+    """Adds a new user to the database with a hashed password."""
+    password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT INTO users (username, password_hash, role, can_view_shrinkage, can_view_volume, can_view_capacity, can_manage_schedules)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (username, password_hash, role, permissions['can_view_shrinkage'], permissions['can_view_volume'], permissions['can_view_capacity'], permissions['can_manage_schedules']))
+            conn.commit()
+            print(f"User '{username}' added successfully.")
+            return True
+        except sqlite3.IntegrityError:
+            print(f"Error: Username '{username}' already exists.")
+            return False
+def bulk_add_users(df):
+    """Adds multiple users from a DataFrame, skipping duplicates."""
+    success_count = 0
+    fail_count = 0
+    for _, row in df.iterrows():
+        permissions = {
+            'can_view_shrinkage': 1 if str(row['can_view_shrinkage']).lower() == 'yes' else 0,
+            'can_view_volume': 1 if str(row['can_view_volume']).lower() == 'yes' else 0,
+            'can_view_capacity': 1 if str(row['can_view_capacity']).lower() == 'yes' else 0,
+            'can_manage_schedules': 1 if str(row['can_manage_schedules']).lower() == 'yes' else 0,
+        }
+        if add_user(row['username'], row['password'], row['role'], permissions):
+            success_count += 1
+        else:
+            fail_count += 1
+    return success_count, fail_count
+
+def update_user(username, new_password, role, permissions):
+    """Updates an existing user's details and optionally their password."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        if new_password:
+            password_hash = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+            cursor.execute('''
+                UPDATE users SET password_hash=?, role=?, can_view_shrinkage=?, can_view_volume=?, can_view_capacity=?, can_manage_schedules=?
+                WHERE username=?
+            ''', (password_hash, role, permissions['can_view_shrinkage'], permissions['can_view_volume'], permissions['can_view_capacity'], permissions['can_manage_schedules'], username))
+        else:
+            cursor.execute('''
+                UPDATE users SET role=?, can_view_shrinkage=?, can_view_volume=?, can_view_capacity=?, can_manage_schedules=?
+                WHERE username=?
+            ''', (role, permissions['can_view_shrinkage'], permissions['can_view_volume'], permissions['can_view_capacity'], permissions['can_manage_schedules'], username))
+        conn.commit()
+
+def delete_user(username):
+    """Deletes a user from the database."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM users WHERE username=?', (username,))
+        conn.commit()
 
 @st.cache_data(ttl=600)
-def load_user_credentials(file_path="users.xlsx"):
-    """Loads user credentials from the specified Excel file."""
-    try:
-        df = pd.read_excel(file_path)
-        if 'username' not in df.columns or 'password' not in df.columns:
-            st.error("Invalid users.xlsx file. It must contain 'username' and 'password' columns.")
-            return None
-        df['password'] = df['password'].astype(str)
+def get_all_users():
+    """Fetches all users from the database."""
+    with get_db_connection() as conn:
+        df = pd.read_sql_query('SELECT username, role, can_view_shrinkage, can_view_volume, can_view_capacity, can_manage_schedules FROM users', conn)
         return df
-    except FileNotFoundError:
-        st.error("`users.xlsx` not found. Please create it in the same directory as the app.")
-        return None
-    except Exception as e:
-        st.error(f"Error loading user credentials: {e}")
-        return None
 
-def check_password():
-    """Renders a login form and returns `True` if credentials are correct."""
-    credentials_df = load_user_credentials()
+def get_user_by_username(username):
+    """Fetches a single user's record for authentication."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM users WHERE username=?', (username,))
+        return cursor.fetchone()
 
-    if st.session_state.get("password_correct", False):
-        return True
+def check_password_hash(password, password_hash):
+    """Checks a plaintext password against a hash."""
+    return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
 
-    if credentials_df is None:
-        return False
+def log_job_run(job_type, status, error_code, time_took, details):
+    """Appends a record to the unified run history."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO runs (job_type, job_run_by, timestamp, status, details)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (job_type, st.session_state.get("username", "N/A"), datetime.now().strftime("%Y-%m-%d %H:%M:%S"), status, str(details)))
+        conn.commit()
+    get_run_history.clear()
 
-    st.markdown("""
-        <style>
-            @import url('https://fonts.googleapis.com/css2?family=Poppins:ital,wght@0,400;0,600;1,400;1,600&display=swap');
-            body, .stApp {
-                font-family: 'Poppins', sans-serif;
+@st.cache_data
+def get_run_history():
+    """Fetches run history from the database."""
+    with get_db_connection() as conn:
+        df = pd.read_sql_query('SELECT job_type, job_run_by, timestamp, status, details FROM runs ORDER BY timestamp DESC', conn)
+    return df
+def save_capacity_plan(plan_name, queues, start_month, plan_data):
+    """Saves a capacity plan's input data to the database."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT INTO capacity_plans (plan_name, queues, start_month, saved_by, timestamp, plan_data)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                plan_name, 
+                ",".join(queues), 
+                start_month, 
+                st.session_state.get("username", "N/A"),
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                json.dumps(plan_data)
+            ))
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return "A plan with this name already exists."
+        except Exception as e:
+            return f"An error occurred: {e}"
+
+@st.cache_data(ttl=60)
+def get_saved_plan_names():
+    """Fetches a list of all saved capacity plan names."""
+    with get_db_connection() as conn:
+        df = pd.read_sql_query("SELECT plan_name FROM capacity_plans ORDER BY timestamp DESC", conn)
+        return df['plan_name'].tolist()
+
+def load_capacity_plan(plan_name):
+    """Loads a saved capacity plan's data from the database."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT queues, start_month, plan_data FROM capacity_plans WHERE plan_name=?", (plan_name,))
+        result = cursor.fetchone()
+        if result:
+            return {
+                "queues": result['queues'].split(','),
+                "start_month": result['start_month'],
+                "plan_data": json.loads(result['plan_data'])
             }
-            [data-testid="stAppViewContainer"] > .main { 
-                background-color: #F0F2F5; 
-            }
-        </style>
-    """, unsafe_allow_html=True)
-
-    col1, col2 = st.columns([0.6, 0.4])
-    with col1:
-        st.image("https://cdn.worldvectorlogo.com/logos/wise-2.svg", width=250)
-        st.subheader("Wise Predictions, Smarter Decisions")
-    with col2:
-        with st.form("login_form"):
-            st.markdown("##### Log in to WiseInsights")
-            username = st.text_input("Username", placeholder="Username")
-            password = st.text_input("Password", type="password", placeholder="Password")
-            submitted = st.form_submit_button("Log In")
-
-            if submitted:
-                user_record = credentials_df[credentials_df['username'] == username]
-                if not user_record.empty and password == user_record.iloc[0]['password']:
-                    st.session_state["password_correct"] = True
-                    st.session_state["username"] = username
-                    st.rerun()
-                else:
-                    st.session_state["password_correct"] = False
-                    st.error("😕 Incorrect username or password.")
+        return None
     
-    return False
-
-
 def initialize_session_state():
-    """Initializes all required session state variables."""
     if 'password_correct' not in st.session_state: st.session_state.password_correct = False
     if 'username' not in st.session_state: st.session_state.username = ""
     if 'run_history' not in st.session_state: st.session_state.run_history = []
@@ -151,41 +304,103 @@ def initialize_session_state():
     if 'volume_daily_results' not in st.session_state: st.session_state.volume_daily_results = None
     if 'manual_volume_results' not in st.session_state: st.session_state.manual_volume_results = None
     if 'backtest_volume_results' not in st.session_state: st.session_state.backtest_volume_results = None
+    if 'capacity_model_results' not in st.session_state: st.session_state.capacity_model_results = None
+    # Add keys for the new monthly planner
+    if 'capacity_plan_inputs' not in st.session_state: st.session_state.capacity_plan_inputs = {}
+    if 'loaded_plan' not in st.session_state: st.session_state.loaded_plan = None
+
+def save_capacity_plan(plan_name, queues, start_month, plan_data):
+    """Saves a capacity plan's input data to the database."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT INTO capacity_plans (plan_name, queues, start_month, saved_by, timestamp, plan_data)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                plan_name, 
+                ",".join(queues), 
+                start_month, 
+                st.session_state.get("username", "N/A"),
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                json.dumps(plan_data)
+            ))
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return "A plan with this name already exists."
+        except Exception as e:
+            return f"An error occurred: {e}"
+
+@st.cache_data(ttl=60)
+def get_saved_plan_names():
+    """Fetches a list of all saved capacity plan names."""
+    with get_db_connection() as conn:
+        df = pd.read_sql_query("SELECT plan_name FROM capacity_plans ORDER BY timestamp DESC", conn)
+        return df['plan_name'].tolist()
+
+def load_capacity_plan(plan_name):
+    """Loads a saved capacity plan's data from the database."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT queues, start_month, plan_data FROM capacity_plans WHERE plan_name=?", (plan_name,))
+        result = cursor.fetchone()
+        if result:
+            return {
+                "queues": result['queues'].split(','),
+                "start_month": result['start_month'],
+                "plan_data": json.loads(result['plan_data'])
+            }
+        return None
 
 
-################################################################################
-#                                                                              #
-#                   SECTION 4: SHRINKAGE FORECAST ENGINE                       #
-#                                                                              #
-################################################################################
+# --- SECTION 4: SHRINKAGE FORECAST ENGINE ---
 
-def log_job_run(job_type, status, error_code, time_took, archive_file="N/A"):
-    """Appends a record to the unified run history."""
-    new_run = {
-        "Job Type": job_type, "Status": status,
-        "Error Code": error_code, "Time Took (s)": f"{time_took:.2f}",
-        "Job run by": st.session_state.get("username", "N/A"), "Archive File": archive_file
-    }
-    st.session_state.run_history.insert(0, new_run)
+def shrink_archive_run_results(run_ts, results_dict):
+    """Saves all result DataFrames from a shrinkage forecast into a timestamped folder."""
+    run_dir = os.path.join(SHRINK_ARCHIVE_DIR, run_ts)
+    os.makedirs(run_dir, exist_ok=True)
+    
+    for forecast_type, data in results_dict['forecasts'].items():
+        for key, df in data.items():
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                file_path = os.path.join(run_dir, f"{forecast_type.lower()}_{key}.xlsx")
+                df.to_excel(file_path)
+
+def shrink_create_zip_for_run(run_ts):
+    """Creates a ZIP archive of a given shrinkage forecast run folder."""
+    run_dir = os.path.join(SHRINK_ARCHIVE_DIR, run_ts)
+    if not os.path.isdir(run_dir): return None
+    
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(run_dir):
+            for file in files:
+                zf.write(os.path.join(root, file), arcname=file)
+    return zip_buffer.getvalue()
 
 def shrink_forecast_moving_average(ts, steps, window=7, freq='D'):
+    """Generates a moving average forecast."""
     if len(ts) < window: window = max(1, len(ts))
     val = ts.rolling(window=window, min_periods=1).mean().iloc[-1]
     future_idx = pd.date_range(ts.index[-1], periods=steps + 1, freq=freq)[1:]
     return pd.Series([val] * steps, index=future_idx).clip(0, 1)
 
 def shrink_forecast_naive(ts, steps, freq='D'):
+    """Generates a naive forecast (repeats the last value)."""
     last_val = ts.iloc[-1] if not ts.empty else 0
     future_idx = pd.date_range(ts.index[-1], periods=steps + 1, freq=freq)[1:]
     return pd.Series([last_val] * steps, index=future_idx).clip(0, 1)
 
 def shrink_forecast_seasonal_naive(ts, steps, freq='D', seasonal_periods=7):
+    """Generates a seasonal naive forecast (repeats the last season's pattern)."""
     if len(ts) < seasonal_periods: return shrink_forecast_naive(ts, steps, freq)
     future_idx = pd.date_range(ts.index[-1], periods=steps + 1, freq=freq)[1:]
     seasonal_pattern = [ts.iloc[-seasonal_periods:].iloc[i % seasonal_periods] for i in range(steps)]
     return pd.Series(seasonal_pattern, index=future_idx).clip(0, 1)
 
 def shrink_forecast_prophet(ts, steps, holidays_df=None, prophet_params=None):
+    """Generates a Prophet forecast."""
     if prophet_params is None: prophet_params = {}
     if len(ts) < 5: return shrink_forecast_moving_average(ts, steps, window=len(ts), freq=ts.index.freq)
     df = ts.reset_index(); df.columns = ['ds', 'y']
@@ -197,6 +412,7 @@ def shrink_forecast_prophet(ts, steps, holidays_df=None, prophet_params=None):
     return preds['yhat'].clip(0, 1)
 
 def shrink_create_forecast_plot(historical_ts, forecast_series, queue_name, shrinkage_type="Total"):
+    """Creates a Plotly graph comparing historical data and forecasts."""
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=historical_ts.index, y=historical_ts.values, mode='lines', name=f'Historical {shrinkage_type}', line=dict(color='royalblue')))
     fig.add_trace(go.Scatter(x=forecast_series.index, y=forecast_series.values, mode='lines', name=f'Forecasted {shrinkage_type}', line=dict(color='crimson', dash='dash')))
@@ -204,6 +420,7 @@ def shrink_create_forecast_plot(historical_ts, forecast_series, queue_name, shri
     return fig
 
 def shrink_create_aggregated_plot(historical_df, forecast_df, aggregation, shrinkage_type="Total"):
+    """Creates a Plotly graph for aggregated (weekly/monthly) forecasts."""
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=historical_df.mean(axis=1).index, y=historical_df.mean(axis=1).values, mode='lines', name='Historical Avg', line=dict(color='royalblue')))
     fig.add_trace(go.Scatter(x=forecast_df.mean(axis=1).index, y=forecast_df.mean(axis=1).values, mode='lines', name='Forecasted Avg', line=dict(color='crimson', dash='dash')))
@@ -211,6 +428,7 @@ def shrink_create_aggregated_plot(historical_df, forecast_df, aggregation, shrin
     return fig
 
 def shrink_backtest_forecast(ts, horizon, method):
+    """Performs backtesting to evaluate a model's historical accuracy."""
     forecasts, actuals = pd.Series(dtype=float), ts.copy()
     for i in range(len(ts) - horizon, 0, -horizon):
         train = ts.iloc[:i]
@@ -225,6 +443,7 @@ def shrink_backtest_forecast(ts, horizon, method):
 
 @st.cache_data
 def shrink_process_raw_data(raw_df):
+    """Processes the raw uploaded Excel data for shrinkage analysis."""
     df = raw_df.copy()
     rename_map = {'Activity End Time (UTC) Date': 'Date', 'Activity Start Time (UTC) Hour of Day': 'Hour', 'Site Name': 'Queue', 'Scheduled Paid Time (h)': 'Scheduled_Hours', 'Absence Time [Planned] (h)': 'Planned_Absence_Hours', 'Absence Time [Unplanned] (h)': 'Unplanned_Absence_Hours'}
     df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns}, inplace=True)
@@ -242,6 +461,7 @@ def shrink_process_raw_data(raw_df):
 
 @st.cache_data
 def shrink_run_forecasting(_df, forecast_horizon_days, shrinkage_col):
+    """Orchestrates the model competition to find the best forecast."""
     queues = _df["Queue"].unique()
     all_forecasts, errors, historical_ts_map = {}, [], {}
     for queue in queues:
@@ -268,24 +488,31 @@ def shrink_run_forecasting(_df, forecast_horizon_days, shrinkage_col):
 
 @st.cache_data
 def shrink_generate_interval_forecast(_daily_forecast_df, _historical_df, shrinkage_col):
+    """Disaggregates a daily forecast into interval-level forecasts using historical patterns."""
     if _daily_forecast_df.empty or _historical_df.empty: return pd.DataFrame()
-    hist = _historical_df.copy(); hist['Hour'] = hist.index.hour; hist['DayOfWeek'] = hist.index.day_name()
+    hist = _historical_df.copy()
+    hist['Hour'] = hist.index.hour
+    hist['DayOfWeek'] = hist.index.day_name()
     profiles = pd.merge(hist.groupby(['Queue', 'DayOfWeek', 'Hour'])[shrinkage_col].mean().reset_index(), hist.groupby(['Queue', 'DayOfWeek'])[shrinkage_col].mean().reset_index().rename(columns={shrinkage_col: 'Hist_Daily_Avg'}), on=['Queue', 'DayOfWeek'])
-    shrinkage_type = shrinkage_col.split('_')[0]
+    
     all_interval_forecasts = []
     for queue in _daily_forecast_df.columns:
         for date, daily_forecast_val in _daily_forecast_df[queue].items():
             day_profile = profiles[(profiles['Queue'] == queue) & (profiles['DayOfWeek'] == date.strftime('%A'))].copy()
             if day_profile.empty or day_profile['Hist_Daily_Avg'].iloc[0] == 0: continue
             adjustment_factor = daily_forecast_val / day_profile['Hist_Daily_Avg'].iloc[0]
-            day_profile[f'Forecasted_{shrinkage_type}'] = (day_profile[shrinkage_col] * adjustment_factor).clip(0, 0.7)
-            day_profile['Timestamp'] = day_profile['Hour'].apply(lambda h: date.replace(hour=int(h)))
+            
+            day_profile.loc[:, f'Forecasted_{shrinkage_col}'] = (day_profile[shrinkage_col] * adjustment_factor).clip(0, 0.7)
+            day_profile.loc[:, 'Timestamp'] = day_profile['Hour'].apply(lambda h: date.replace(hour=int(h)))
+            
             all_interval_forecasts.append(day_profile)
+    
     if not all_interval_forecasts: return pd.DataFrame()
     return pd.concat(all_interval_forecasts)
 
 @st.cache_data
 def shrink_generate_aggregated_forecasts(_daily_forecast_df):
+    """Rolls up daily forecasts into weekly and monthly summaries."""
     if _daily_forecast_df.empty: return pd.DataFrame(), pd.DataFrame()
     weekly_df = _daily_forecast_df.resample('W-MON', label='left', closed='left').mean()
     if not weekly_df.empty: weekly_df.loc['Subtotal'] = weekly_df.mean()
@@ -293,282 +520,10 @@ def shrink_generate_aggregated_forecasts(_daily_forecast_df):
     if not monthly_df.empty: monthly_df.loc['Subtotal'] = monthly_df.mean()
     return weekly_df, monthly_df
 
-def render_shrinkage_forecast_tab():
-    st.header("Shrinkage Forecast")
-    
-    # FIX: Restyled upload section
-    with st.container(border=True):
-        st.subheader("1. Upload Shrinkage Data")
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            uploaded_file = st.file_uploader("Upload Shrinkage Raw Excel Data", type=["xlsx", "xls"], key="shrink_uploader", label_visibility="collapsed")
-        with col2:
-            st.write("") 
-            st.write("")
-            shrink_template_df = pd.DataFrame({'Activity End Time (UTC) Date': [pd.Timestamp('2025-01-01')], 'Activity Start Time (UTC) Hour of Day': [8], 'Site Name': ['Queue_A'], 'Scheduled Paid Time (h)': [100.5], 'Absence Time [Planned] (h)': [8.0], 'Absence Time [Unplanned] (h)': [4.5]})
-            st.download_button(label="⬇️ Download Data Template", data=to_excel_bytes(shrink_template_df, index=False), file_name="shrinkage_template.xlsx", use_container_width=True)
+# --- SECTION 5: VOLUME FORECAST ENGINE ---
 
-    if uploaded_file:
-        raw_data = pd.read_excel(uploaded_file)
-        with st.expander("📄 View Raw Data Preview"):
-            st.dataframe(raw_data.head(), use_container_width=True, hide_index=True)
-        
-        with st.container(border=True):
-            st.subheader("2. Configure & Run Forecast")
-            form_cols = st.columns([1, 3])
-            with form_cols[0]:
-                horizon = st.number_input("Forecast Horizon (days)", 1, 90, 14, 1, key="shrink_horizon")
-            with form_cols[1]:
-                st.write("")
-                st.write("")
-                if st.button("🚀 Run Shrinkage Forecast", key="run_shrinkage", use_container_width=True):
-                    # FIX: Added spinner for better user feedback
-                    with st.spinner("⏳ Running shrinkage forecast..."):
-                        st.session_state.start_time = time.time()
-                        error_code = "N/A"; status = "Success"
-                        try:
-                            processed_data = shrink_process_raw_data(raw_data)
-                            if processed_data is not None:
-                                forecasts = {}
-                                shrinkage_definitions = {'Total': 'Total_Shrinkage', 'Planned': 'Planned_Shrinkage', 'Unplanned': 'Unplanned_Shrinkage'}
-                                for i, (typ, col) in enumerate(shrinkage_definitions.items()):
-                                    daily_df, best_df, hist_map = shrink_run_forecasting(processed_data, int(horizon), col)
-                                    interval_df = shrink_generate_interval_forecast(daily_df, processed_data, col)
-                                    weekly_df, monthly_df = shrink_generate_aggregated_forecasts(daily_df)
-                                    backtest_dict = {q: shrink_backtest_forecast(hist_map[q], horizon, best_df.loc[best_df['Queue']==q, 'Method'].iloc[0] if q in best_df['Queue'].values else 'Prophet') for q in hist_map if len(hist_map[q]) > horizon}
-                                    forecasts[typ] = {"daily": daily_df, "best": best_df, "hist": hist_map, "interval": interval_df, "weekly": weekly_df, "monthly": monthly_df, "backtest": backtest_dict}
-                                st.session_state['shrinkage_results'] = {"forecasts": forecasts, "queues": processed_data["Queue"].unique(), "processed_data": processed_data, "types": ['Total', 'Planned', 'Unplanned'], "cols": shrinkage_definitions, "historical_min_date": processed_data.index.min().date(), "historical_max_date": processed_data.index.max().date()}
-                            else: status = "Error"; error_code = "ERR#2"
-                        except ValueError: status = "Error"; error_code = "ERR#2"; st.error("Data processing failed. Please check your Excel file.")
-                        except Exception: status = "Error"; error_code = "ERR#4"; st.error("An unexpected error occurred.")
-                        
-                        log_job_run("Shrinkage Forecast", status, error_code, time.time() - st.session_state.start_time)
-                    if status == "Success": 
-                        st.success("Shrinkage forecast completed!")
-                        time.sleep(1) # Brief pause to let user see success message
-                    st.rerun()
-
-    if 'shrinkage_results' in st.session_state and st.session_state.shrinkage_results:
-        res = st.session_state.shrinkage_results
-        st.subheader("3. View Results")
-        with st.container(border=True):
-            st.markdown("**Global Display Filters**")
-            sel_type = st.radio("Shrinkage Type", res['types'], horizontal=True, key="global_shrinkage_type")
-            sel_queues = st.multiselect("Select Queues", ["All"] + list(res['queues']), default=["All"], key="global_queues")
-        
-        all_possible_queues = list(res['queues'])
-        
-        if "All" in sel_queues or (set(sel_queues) == set(all_possible_queues)):
-            queues_to_show = all_possible_queues
-        else:
-            queues_to_show = sel_queues
-
-        data = res['forecasts'][sel_type]; col = res['cols'][sel_type]
-
-        tab_hist, tab_monthly, tab_weekly, tab_daily, tab_comp, tab_manual = st.tabs(["Historical Patterns", "Monthly Summary", "Weekly Summary", "Daily Forecast", "Comparison", "Manual"])
-
-        with tab_hist:
-            with st.container(border=True):
-                st.header("Historical Shrinkage Patterns")
-                data_to_pivot = res['processed_data'][res['processed_data']['Queue'].isin(queues_to_show)]
-                if not data_to_pivot.empty:
-                    st.info(f"Displaying historical patterns for: **{', '.join(queues_to_show)}**")
-                    days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-                    df_pivot = data_to_pivot.pivot_table(index=data_to_pivot.index.hour, columns=data_to_pivot.index.day_name(), values=col, aggfunc='mean')
-                    df_pivot = df_pivot.reindex(columns=days_order).fillna(0)
-                    st.dataframe(df_pivot.style.background_gradient(cmap='RdYlGn_r', axis=None).format("{:.2%}"), use_container_width=True)
-                    st.download_button("Download Pattern Table", to_excel_bytes(df_pivot), f"historical_pattern_{'_'.join(queues_to_show)}.xlsx")
-                else: st.warning("No data available for the selected queues.")
-                with st.expander("View Historical vs. Forecast Graph", expanded=st.session_state.shrink_show_graphs):
-                    for q_graph in queues_to_show:
-                        if q_graph in data['hist'] and q_graph in data['daily']:
-                            fig = shrink_create_forecast_plot(data['hist'][q_graph], data['daily'][q_graph], q_graph, sel_type)
-                            st.plotly_chart(fig, use_container_width=True, key=f"hist_chart_{q_graph}")
-
-        with tab_monthly:
-            with st.container(border=True):
-                st.header("Monthly Forecast Summary"); df = data['monthly'][[q for q in queues_to_show if q in data['monthly'].columns]]
-                if not df.empty:
-                    st.dataframe(df.style.format("{:.2%}"), use_container_width=True)
-                    st.download_button("Download Monthly Forecast", to_excel_bytes(df), f"monthly_{sel_type}_forecast.xlsx")
-                    with st.expander("View Monthly Aggregated Graph", expanded=st.session_state.shrink_show_graphs):
-                        hist_monthly = res['processed_data'][res['processed_data']['Queue'].isin(queues_to_show)].resample('M').mean(numeric_only=True)
-                        fig = shrink_create_aggregated_plot(hist_monthly[[col]], df.drop('Subtotal', errors='ignore'), 'Monthly', sel_type)
-                        st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("No monthly forecast data to display for the selected queues.")
-                
-        with tab_weekly:
-            with st.container(border=True):
-                st.header("Weekly Forecast Summary"); df = data['weekly'][[q for q in queues_to_show if q in data['weekly'].columns]]
-                if not df.empty:
-                    st.dataframe(df.style.format("{:.2%}"), use_container_width=True)
-                    st.download_button("Download Weekly Forecast", to_excel_bytes(df), f"weekly_{sel_type}_forecast.xlsx")
-                    with st.expander("View Weekly Aggregated Graph", expanded=st.session_state.shrink_show_graphs):
-                        hist_weekly = res['processed_data'][res['processed_data']['Queue'].isin(queues_to_show)].resample('W-MON').mean(numeric_only=True)
-                        fig = shrink_create_aggregated_plot(hist_weekly[[col]], df.drop('Subtotal', errors='ignore'), 'Weekly', sel_type)
-                        st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.info("No weekly forecast data to display for the selected queues.")
-
-        with tab_daily:
-            with st.container(border=True):
-                st.header("Daily Forecast")
-                best_methods_df = data['best'][data['best']['Queue'].isin(queues_to_show)].copy()
-                if not best_methods_df.empty:
-                    st.subheader("Best Method Analysis")
-                    best_methods_df['Comments'] = best_methods_df['MAE'].apply(lambda x: get_significance_rating(x * 100, metric_type='mae'))
-                    best_methods_df_display = best_methods_df.copy()
-                    best_methods_df_display['MAE'] = best_methods_df_display['MAE'].map('{:.2%}'.format)
-                    st.dataframe(best_methods_df_display[['Queue', 'Method', 'MAE', 'Comments']], use_container_width=True, hide_index=True)
-                    st.download_button("Download Best Methods", to_excel_bytes(best_methods_df), "shrinkage_best_methods.xlsx")
-                else:
-                    st.info("No best method analysis to display for the selected queues.")
-
-                df_interval = data['interval'][data['interval']['Queue'].isin(queues_to_show)]
-                if not df_interval.empty:
-                    st.subheader("Interval-Level Forecast")
-                    display_df_interval = df_interval.sort_values(by="Timestamp").tail(20)
-                    st.caption("Showing the latest 20 records. Use the download button for the full forecast.")
-                    
-                    # FIX: Format relevant columns as percentages and hide index
-                    format_dict = {
-                        'Planned_Shrinkage': '{:.2%}', 'Unplanned_Shrinkage': '{:.2%}',
-                        'Total_Shrinkage': '{:.2%}', 'Hist_Daily_Avg': '{:.2%}',
-                        'Forecasted_Total': '{:.2%}', 'Forecasted_Planned': '{:.2%}',
-                        'Forecasted_Unplanned': '{:.2%}'
-                    }
-                    st.dataframe(display_df_interval.style.format(format_dict, na_rep='-'), use_container_width=True, hide_index=True)
-                    st.download_button("Download Full Interval Forecast Data", to_excel_bytes(df_interval), f"interval_{sel_type}_forecast.xlsx", key=f"download_interval_{sel_type}")
-                else: st.info("No interval-level data to display.")
-                with st.expander("View Daily Forecast Graphs", expanded=st.session_state.shrink_show_graphs):
-                    for q_graph in queues_to_show:
-                        if q_graph in data['hist'] and q_graph in data['daily']:
-                            fig = shrink_create_forecast_plot(data['hist'][q_graph], data['daily'][q_graph], q_graph, sel_type)
-                            st.plotly_chart(fig, use_container_width=True, key=f"daily_chart_{q_graph}")
-
-        with tab_comp:
-            with st.container(border=True):
-                st.header("Shrinkage Comparison (Actual vs. Backtest Forecast)")
-                date_range = st.date_input("Select Date Range for Comparison", [res['historical_min_date'], res['historical_max_date']], min_value=res['historical_min_date'], max_value=res['historical_max_date'], key="comparison_date_range")
-                default_selection = [queues_to_show[0]] if len(queues_to_show) > 0 else []
-                q_comp = st.multiselect("Select Queue(s) for Backtest Comparison:", queues_to_show, default=default_selection)
-                
-                if q_comp:
-                    fig = go.Figure()
-                    for queue in q_comp:
-                        if queue in data['backtest']:
-                            forecasted, actual = data['backtest'][queue]
-                            if date_range and len(date_range) == 2:
-                                actual = actual[(actual.index.date >= date_range[0]) & (actual.index.date <= date_range[1])]
-                                forecasted = forecasted[(forecasted.index.date >= date_range[0]) & (forecasted.index.date <= date_range[1])]
-                            fig.add_trace(go.Scatter(x=actual.index, y=actual, mode='lines', name=f'Actual - {queue}'))
-                            fig.add_trace(go.Scatter(x=forecasted.index, y=forecasted, mode='lines', name=f'Forecast - {queue}', line=dict(dash='dash')))
-                    fig.update_layout(title=f"Backtest Comparison", yaxis=dict(tickformat=".1%"))
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                st.subheader("Download Historical Interval Data")
-                if date_range and len(date_range) == 2:
-                    filtered_processed_data = res['processed_data'][(res['processed_data'].index.date >= date_range[0]) & (res['processed_data'].index.date <= date_range[1]) & (res['processed_data']['Queue'].isin(queues_to_show))]
-                    st.download_button("Download Filtered Interval Data", to_excel_bytes(filtered_processed_data), f"historical_interval_{date_range[0]}_to_{date_range[1]}.xlsx", key="download_comp_interval")
-
-        with tab_manual:
-            with st.container(border=True):
-                # FIX: Overhauled Manual Shrinkage Tab
-                st.header("Manual Shrinkage Forecasting")
-                with st.form("manual_shrinkage_form"):
-                    st.write("#### Configure Manual Forecast")
-                    horizon_manual = st.number_input("Forecast Horizon (days)", 1, 365, 30, key="manual_shrink_horizon")
-                    models_to_run = st.multiselect("Select models to run:", ["Seasonal Naive", "Moving Average", "Prophet"], default=["Seasonal Naive"])
-                    submitted_manual = st.form_submit_button("🚀 Run Manual Shrinkage Forecast")
-
-                if submitted_manual:
-                    if not models_to_run:
-                        st.error("Please select at least one model to run.")
-                    else:
-                        manual_forecasts = {}
-                        queues_manual = res['processed_data']['Queue'].unique()
-                        
-                        with st.spinner("Running manual forecast..."):
-                            for q in queues_manual:
-                                ts = res['processed_data'][res['processed_data']["Queue"] == q][col].resample('D').mean().fillna(0)
-                                if ts.empty: continue
-
-                                for model_name in models_to_run:
-                                    try:
-                                        if model_name == "Seasonal Naive":
-                                            forecast = shrink_forecast_seasonal_naive(ts, horizon_manual)
-                                        elif model_name == "Moving Average":
-                                            forecast = shrink_forecast_moving_average(ts, horizon_manual)
-                                        elif model_name == "Prophet":
-                                            forecast = shrink_forecast_prophet(ts, horizon_manual)
-                                        
-                                        if not forecast.empty:
-                                            manual_forecasts[(q, model_name)] = forecast
-                                    except Exception as e:
-                                        st.warning(f"Model '{model_name}' failed for queue '{q}': {e}")
-                        st.session_state.manual_shrinkage_results = pd.DataFrame(manual_forecasts)
-
-                # FIX: Added robust check for None before checking .empty
-                manual_results = st.session_state.get('manual_shrinkage_results')
-                if manual_results is not None and not manual_results.empty:
-                    st.subheader("Manual Forecast Results")
-                    df_manual = st.session_state.manual_shrinkage_results
-                    st.dataframe(df_manual.style.format("{:.2%}"), use_container_width=True)
-                    st.download_button("Download Manual Forecast", to_excel_bytes(df_manual), "manual_shrinkage_forecast.xlsx")
-
-
-################################################################################
-#                                                                              #
-#                   SECTION 5: VOLUME FORECAST ENGINE                          #
-#                                                                              #
-################################################################################
-
-# ------------------------------------------------------------------------------
-# 5.1. Volume: Archiving and Global Variables
-# ------------------------------------------------------------------------------
-
-VOL_ARCHIVE_DIR = "volume_forecast_archive"
-os.makedirs(VOL_ARCHIVE_DIR, exist_ok=True)
 COUNTRY_CODES = {"United States": "US", "United Kingdom": "GB", "Canada": "CA", "Australia": "AU", "Germany": "DE", "France": "FR", "Spain": "ES", "Italy": "IT", "India": "IN", "Brazil": "BR", "Mexico": "MX", "Japan": "JP", "None": "NONE"}
 COUNTRY_NAMES = sorted(list(COUNTRY_CODES.keys()))
-
-def vol_archive_run_results(run_ts, results, fcast_type):
-    """Saves all result DataFrames from a forecast run into a timestamped folder."""
-    run_dir = os.path.join(VOL_ARCHIVE_DIR, run_ts)
-    os.makedirs(run_dir, exist_ok=True)
-    prefix = "daily" if fcast_type == "Daily" else "monthly"
-    for key, df in results.items():
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            with open(os.path.join(run_dir, f"{prefix}_{key}.xlsx"), "wb") as f:
-                f.write(to_excel_bytes(df, index=True))
-
-def vol_create_zip_for_run(run_ts):
-    """Creates a ZIP archive of a given forecast run folder."""
-    run_dir = os.path.join(VOL_ARCHIVE_DIR, run_ts)
-    if not os.path.isdir(run_dir): return None
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(run_dir):
-            for file in files: zf.write(os.path.join(root, file), arcname=file)
-    return zip_buffer.getvalue()
-
-def vol_get_archived_runs():
-    """Returns a list of all archived run timestamps."""
-    try:
-        return sorted([d for d in os.listdir(VOL_ARCHIVE_DIR) if os.path.isdir(os.path.join(VOL_ARCHIVE_DIR, d))], reverse=True)
-    except FileNotFoundError: return []
-
-# ------------------------------------------------------------------------------
-# 5.2. Volume: Data Preparation and Plotting
-# ------------------------------------------------------------------------------
-
-def robust_interval_to_timedelta(s):
-    """Robustly converts a Series to timedelta."""
-    if pd.api.types.is_numeric_dtype(s):
-        return pd.to_timedelta(s * 24 * 3600, unit="s")
-    else:
-        return pd.to_timedelta(s.astype(str), errors="coerce")
 
 def vol_prepare_full_data(df):
     """Processes raw uploaded data for volume forecasting."""
@@ -576,9 +531,12 @@ def vol_prepare_full_data(df):
         raise ValueError("Volume file missing required columns: Date, Interval, Volume, Queue")
     
     df = df.copy()
-    df["Interval_td"] = robust_interval_to_timedelta(df["Interval"])
-    df.dropna(subset=['Interval_td'], inplace=True)
+    if pd.api.types.is_numeric_dtype(df["Interval"]):
+        df["Interval_td"] = pd.to_timedelta(df["Interval"] * 24 * 3600, unit="s")
+    else:
+        df["Interval_td"] = pd.to_timedelta(df["Interval"].astype(str), errors="coerce")
     
+    df.dropna(subset=['Interval_td'], inplace=True)
     df["Timestamp"] = pd.to_datetime(df["Date"]) + df["Interval_td"]
     return df.set_index("Timestamp")
 
@@ -598,10 +556,6 @@ def vol_create_forecast_plot(historical_ts, forecast_series, queue_name, period_
     fig.add_trace(go.Scatter(x=forecast_series.index, y=forecast_series.values, mode='lines', name='Best Forecast', line=dict(color='crimson', dash='dash')))
     fig.update_layout(title=f'Best Forecast vs. Historical Data for: {queue_name}', xaxis_title=period_name, yaxis_title='Volume')
     return fig
-
-# ------------------------------------------------------------------------------
-# 5.3. Volume: Core Forecasting Models & Functions
-# ------------------------------------------------------------------------------
 
 def vol_forecast_naive(ts, steps, freq='MS'):
     """Generates a naive forecast."""
@@ -630,50 +584,14 @@ def vol_forecast_moving_average(ts, steps, window=3, freq='MS'):
         return pd.Series([val] * steps, index=future_idx).round()
     except Exception: return pd.Series(dtype=float)
 
-def vol_forecast_weighted_moving_average(ts, steps, window=4, freq='MS'):
-    """Generates a weighted moving average forecast."""
-    try:
-        if len(ts) < window: window = max(1, len(ts))
-        weights = np.arange(1, window + 1)
-        wma_series = ts.rolling(window, min_periods=1).apply(lambda x: np.dot(x, weights[:len(x)]) / weights[:len(x)].sum(), raw=True)
-        val = wma_series.iloc[-1]
-        future_idx = pd.date_range(ts.index[-1], periods=steps + 1, freq=freq)[1:]
-        return pd.Series([val] * steps, index=future_idx).round()
-    except Exception: return pd.Series(dtype=float)
-
-def vol_forecast_double_exp_smoothing(ts, steps, freq='MS'):
-    """Generates a double exponential smoothing forecast."""
-    try:
-        if len(ts) < 3: return vol_forecast_moving_average(ts, steps, window=len(ts), freq=freq)
-        model = ExponentialSmoothing(ts, trend="add", seasonal=None).fit()
-        fc = model.forecast(steps)
-        fc.index = pd.date_range(ts.index[-1], periods=steps + 1, freq=freq)[1:]
-        return fc.round()
-    except Exception: return pd.Series(dtype=float)
-
 def vol_forecast_holtwinters(ts, steps, freq='MS', seasonal_periods=12):
     """Generates a Holt-Winters (triple exponential smoothing) forecast."""
     try:
-        if len(ts) < seasonal_periods * 2: return vol_forecast_double_exp_smoothing(ts, steps, freq)
+        if len(ts) < seasonal_periods * 2: return pd.Series(dtype=float)
         model = ExponentialSmoothing(ts, trend="add", seasonal="add", seasonal_periods=seasonal_periods).fit()
         fc = model.forecast(steps)
         fc.index = pd.date_range(ts.index[-1], periods=steps + 1, freq=freq)[1:]
         return fc.round()
-    except Exception: return pd.Series(dtype=float)
-
-def vol_forecast_decomposition(ts, steps, freq='MS', seasonal_periods=12):
-    """Generates a forecast based on seasonal decomposition."""
-    try:
-        if len(ts) < seasonal_periods * 2: return vol_forecast_moving_average(ts, steps, window=min(3, len(ts)), freq=freq)
-        result = seasonal_decompose(ts, model='additive', period=seasonal_periods)
-        last_trend_val = result.trend.dropna().iloc[-1]
-        trend_diff = result.trend.diff().mean()
-        future_trend = np.arange(1, steps + 1) * trend_diff + last_trend_val
-        last_seasonal_cycle = result.seasonal.tail(seasonal_periods)
-        future_seasonal = np.tile(last_seasonal_cycle, steps // seasonal_periods + 1)[:steps]
-        fc = future_trend + future_seasonal
-        future_idx = pd.date_range(ts.index[-1], periods=steps + 1, freq=freq)[1:]
-        return pd.Series(fc, index=future_idx).round()
     except Exception: return pd.Series(dtype=float)
 
 def vol_forecast_sarima(ts, steps, order, seasonal_order, freq='MS'):
@@ -732,11 +650,6 @@ def vol_forecast_ml(ts, steps, model, freq='D'):
     except Exception:
         return pd.Series(dtype=float)
 
-# ------------------------------------------------------------------------------
-# 5.4. Volume: Main Forecasting Pipelines
-# ------------------------------------------------------------------------------
-
-@st.cache_data
 def vol_run_monthly_forecasting(_df, horizon):
     """Orchestrates the monthly volume forecasting process by running a model competition."""
     df_prep = vol_prepare_full_data(_df)
@@ -759,13 +672,13 @@ def vol_run_monthly_forecasting(_df, horizon):
         train, test = (ts[:-test_size], ts[-test_size:]) if test_size > 0 else (ts, ts[-1:])
 
         fcts = {
-          "Naive": lambda d, s: vol_forecast_naive(d, s, freq='MS'),
-          "Seasonal Naive": lambda d, s: vol_forecast_seasonal_naive(d, s, freq='MS'),
-          "Moving Average (3m)": lambda d, s: vol_forecast_moving_average(d, s, window=3, freq='MS'),
-          "Holt-Winters": lambda d, s: vol_forecast_holtwinters(d, s, freq='MS'),
-          "SARIMA": lambda d, s: vol_forecast_sarima(d, s, (1,1,1), (1,1,1,12), freq='MS'),
-          "Prophet": lambda d, s: vol_forecast_prophet(d, s, freq='MS'),
-          "Random Forest": lambda d, s: vol_forecast_ml(d, s, RandomForestRegressor(n_estimators=100, random_state=42), freq='MS'),
+            "Naive": lambda d, s: vol_forecast_naive(d, s, freq='MS'),
+            "Seasonal Naive": lambda d, s: vol_forecast_seasonal_naive(d, s, freq='MS'),
+            "Moving Average (3m)": lambda d, s: vol_forecast_moving_average(d, s, window=3, freq='MS'),
+            "Holt-Winters": lambda d, s: vol_forecast_holtwinters(d, s, freq='MS'),
+            "SARIMA": lambda d, s: vol_forecast_sarima(d, s, (1,1,1), (1,1,1,12), freq='MS'),
+            "Prophet": lambda d, s: vol_forecast_prophet(d, s, freq='MS'),
+            "Random Forest": lambda d, s: vol_forecast_ml(d, s, RandomForestRegressor(n_estimators=100, random_state=42), freq='MS'),
         }
         
         for name, func in fcts.items():
@@ -886,7 +799,6 @@ def vol_run_daily_forecasting(_df, horizon, country_code):
     
     return all_forecasts_df, error_df, best_forecast_df, best_methods_df, df_prep
 
-@st.cache_data
 def vol_backtest_forecast(ts, _model_func, horizon):
     """Performs backtesting for a given model and time series."""
     forecasts = pd.Series(dtype=float)
@@ -907,8 +819,6 @@ def vol_backtest_forecast(ts, _model_func, horizon):
     results = pd.DataFrame({'Actual': ts, 'Forecast': forecasts}).dropna()
     return results
 
-
-@st.cache_data
 def vol_generate_interval_forecast(daily_forecast_df, historical_df):
     """Disaggregates a daily volume forecast into interval-level forecasts."""
     if daily_forecast_df.empty or historical_df.empty: return pd.DataFrame()
@@ -948,7 +858,6 @@ def vol_generate_interval_forecast(daily_forecast_df, historical_df):
     if not all_interval_forecasts: return pd.DataFrame()
     return pd.concat(all_interval_forecasts)[['Timestamp', 'Queue', 'Forecast_Volume']].round()
 
-@st.cache_data
 def vol_generate_monthly_interval_forecast(monthly_forecast_df, historical_df):
     """Disaggregates a monthly volume forecast into interval-level forecasts."""
     if monthly_forecast_df.empty or historical_df.empty:
@@ -1020,16 +929,484 @@ def vol_generate_monthly_interval_forecast(monthly_forecast_df, historical_df):
     if not all_interval_forecasts: return pd.DataFrame()
     return pd.concat(all_interval_forecasts)[['Timestamp', 'Queue', 'Forecast_Volume']].round()
 
-# ------------------------------------------------------------------------------
-# 5.5. Volume: Main UI Rendering Function
-# ------------------------------------------------------------------------------
+# --- SECTION 6: CAPACITY PLANNING HELPER FUNCTIONS ---
+
+def run_workload_model(login_hours, aht_seconds, volume, occupancy, concurrency):
+    """Calculates required FTE based on workload, with concurrency."""
+    if concurrency <= 0: concurrency = 1
+    adjusted_volume = volume / concurrency
+    total_handle_time_hours = (adjusted_volume * aht_seconds) / 3600
+    base_fte = total_handle_time_hours / login_hours
+    adjusted_fte = base_fte / (occupancy / 100)
+    return {"Required FTE": math.ceil(adjusted_fte)}
+
+def run_erlang_c_model(login_hours, aht_seconds, volume, sla_target_percent, sla_target_seconds, concurrency):
+    """Calculates required agents and wait time using Erlang C."""
+    if concurrency <= 0: concurrency = 1
+    adjusted_volume = volume / concurrency
+    if adjusted_volume == 0: return {"Required HC": 0, "Predicted SL (%)": 100, "Avg Wait (s)": 0}
+    
+    interval_minutes = login_hours * 60
+    # Handle potential division by zero if interval is 0
+    if interval_minutes == 0: return {"Required HC": 0, "Predicted SL (%)": 0, "Avg Wait (s)": 0}
+
+    traffic_intensity = (adjusted_volume * (aht_seconds / 60)) / interval_minutes
+    num_agents = math.ceil(traffic_intensity)
+    if num_agents == 0: num_agents = 1
+    
+    while True:
+        try:
+            erlang_b_num = traffic_intensity**num_agents / math.factorial(num_agents)
+            erlang_b_den = sum(traffic_intensity**i / math.factorial(i) for i in range(num_agents + 1))
+            prob_wait = erlang_b_num / erlang_b_den
+            sl = (1 - prob_wait * math.exp(-(num_agents - traffic_intensity) * (sla_target_seconds / aht_seconds))) * 100
+        except (OverflowError, ValueError): sl = 100
+        if sl >= sla_target_percent or num_agents > traffic_intensity * 2 + 50: break
+        num_agents += 1
+    
+    avg_wait_overall = -1
+    if (num_agents - traffic_intensity) > 0:
+        avg_wait_for_queued = aht_seconds / (num_agents - traffic_intensity)
+        avg_wait_overall = prob_wait * avg_wait_for_queued
+
+    return {"Required HC": num_agents, "Predicted SL (%)": round(sl, 2), "Avg Wait (s)": round(avg_wait_overall, 2)}
+
+def run_monte_carlo_hc_model(login_hours, aht_seconds, volume, sla_target_percent, sla_target_seconds, concurrency, num_simulations=1000):
+    """Calculates required HC to meet an SLA target using Monte Carlo simulation."""
+    if concurrency <= 0: concurrency = 1
+    adjusted_volume = volume / concurrency
+    if adjusted_volume == 0: return {"Required HC": 0, "Predicted SLA (%)": 100, "Avg Wait (s)": 0}
+    
+    interval_seconds = login_hours * 3600
+    if interval_seconds <= 0: return {"Required HC": 0, "Predicted SLA (%)": 0, "Avg Wait (s)": 0}
+
+    arrival_rate = adjusted_volume / interval_seconds
+    traffic_intensity = (adjusted_volume * aht_seconds) / interval_seconds
+    num_agents = math.ceil(traffic_intensity)
+    if num_agents == 0: num_agents = 1
+
+    while True:
+        wait_times = []
+        sim_volume = int(min(adjusted_volume, 1000)) # Limit simulation size for performance
+        if arrival_rate <= 0:
+            predicted_sla = 100
+            break
+
+        # This part is computationally intensive, running a simplified simulation
+        inter_arrival_times = np.random.exponential(1/arrival_rate, size=sim_volume)
+        arrival_times = np.cumsum(inter_arrival_times)
+        service_times = np.random.exponential(aht_seconds, size=sim_volume)
+        finish_times = np.zeros(num_agents)
+        for i in range(sim_volume):
+            agent_available_time = np.min(finish_times)
+            start_time = max(arrival_times[i], agent_available_time)
+            finish_time = start_time + service_times[i]
+            wait_times.append(start_time - arrival_times[i])
+            finish_times[np.argmin(finish_times)] = finish_time
+        
+        sla_met_count = np.sum(np.array(wait_times) <= sla_target_seconds)
+        predicted_sla = (sla_met_count / len(wait_times)) * 100 if wait_times else 100
+        
+        if predicted_sla >= sla_target_percent or num_agents > traffic_intensity * 2 + 50: break
+        num_agents += 1
+        
+    avg_wait = np.mean(wait_times) if wait_times else 0
+    return {"Required HC": num_agents, "Predicted SLA (%)": round(predicted_sla, 2), "Avg Wait (s)": round(avg_wait, 2)}
+
+
+def run_fte_optimization_model(inputs):
+    """Finds the most cost-effective mix of FTEs using OR-Tools."""
+    required_call_hours = math.ceil((inputs['call_volume'] * inputs['call_aht_sec']) / 3600)
+    concurrency = inputs['concurrency'] if inputs['concurrency'] > 0 else 1
+    required_email_hours = math.ceil(((inputs['email_volume'] * inputs['email_aht_sec']) / 3600) / concurrency)
+    
+    model = cp_model.CpModel()
+    max_fte = int((required_call_hours + required_email_hours) / inputs['hours_per_fte']) + 10
+    num_voice_fte = model.NewIntVar(0, max_fte, 'num_voice_fte')
+    num_email_fte = model.NewIntVar(0, max_fte, 'num_email_fte')
+    num_blended_fte = model.NewIntVar(0, max_fte, 'num_blended_fte')
+    hours_per_fte = int(inputs['hours_per_fte'])
+    
+    model.Add(num_voice_fte * hours_per_fte + num_blended_fte * hours_per_fte >= required_call_hours)
+    model.Add(num_email_fte * hours_per_fte + num_blended_fte * hours_per_fte >= required_email_hours)
+    
+    total_cost = (num_voice_fte * inputs['cost_voice']) + (num_email_fte * inputs['cost_email']) + (num_blended_fte * inputs['cost_blended'])
+    model.Minimize(total_cost)
+    
+    solver = cp_model.CpSolver()
+    status = solver.Solve(model)
+    
+    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        voice = solver.Value(num_voice_fte)
+        email = solver.Value(num_email_fte)
+        blended = solver.Value(num_blended_fte)
+        return {
+            "Total FTE": voice + email + blended,
+            "Minimum Cost ($)": f"${int(solver.ObjectiveValue()):,}"
+        }
+    return {"Error": "Could not find an optimal solution."}
+
+# --- SECTION 7: RENDER FUNCTIONS FOR EACH TAB ---
+
+def check_password():
+    """Renders a login form and loads permissions if credentials are correct."""
+    if st.session_state.get("password_correct", False):
+        return True
+
+    st.markdown("""
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Lato:wght@300;400;700&display=swap');
+            
+            html, body, [class*="st-"] {
+                font-family: 'Lato', sans-serif;
+            }
+            .stApp {
+                background-color: #f0f2f5;
+            }
+            header, footer {
+                visibility: hidden !important;
+            }
+            .main .block-container {
+                padding-top: 5rem;
+                padding-bottom: 5rem;
+                max-width: 1000px;
+            }
+            .wise-logo-container {
+                padding-top: 100px;
+            }
+            .wise-logo {
+                width: 400px;
+                height: 220px;
+                quality: 90%;
+            }
+            .wise-tagline {
+                font-family: Lato, sans-serif;
+                font-size: 40px;
+                font-type: bold;
+                color: #1c1e21;
+                line-height: 1.2;
+                padding-bottom: 20px;
+                padding-left: 100px;
+            }
+            div[data-testid="stForm"] {
+                background-color: white;
+                border: none;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0, 0, 0, .1), 0 8px 16px rgba(0, 0, 0, .1);
+                padding: 20px;
+            }
+            div[data-testid="stForm"] .stButton > button {
+                width: 100%;
+                background-color: #00B9FF;
+                color: white;
+                font-size: 20px;
+                font-weight: bold;
+                height: 48px;
+                border-radius: 6px;
+                border: none;
+            }
+            div[data-testid="stForm"] hr {
+                margin: 20px 0;
+            }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    left_col, right_col = st.columns([1.5, 1])
+
+    with left_col:
+        st.markdown('<div class="wise-logo-container"><img src="https://i.postimg.cc/vmwmF50z/Remove-background-project.png" class="wise-logo"></div>', unsafe_allow_html=True)
+        
+
+    with right_col:
+        st.markdown("<h5 style='text-align: center; color: #0d1b3f;'>🔑 Login to WFM Insights</h5>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center; color: #3b3b3b;'>Wise Predictions, Smarter Decisions.</p>", unsafe_allow_html=True)
+        with st.form("login_form"):
+            username = st.text_input("Username", placeholder="Username", label_visibility="collapsed")
+            password = st.text_input("Password", type="password", placeholder="Password", label_visibility="collapsed")
+            submitted = st.form_submit_button("Log In")
+
+            if submitted:
+                user_record = get_user_by_username(username)
+                
+                if user_record and check_password_hash(password, user_record['password_hash']):
+                    st.session_state["password_correct"] = True
+                    st.session_state["username"] = user_record['username']
+                    
+                    permission_cols = ['role', 'can_view_shrinkage', 'can_view_volume', 'can_view_capacity', 'can_manage_schedules']
+                    for col in permission_cols:
+                        value = user_record[col]
+                        if isinstance(value, int):
+                            st.session_state[col] = 'yes' if value == 1 else 'no'
+                        else:
+                            st.session_state[col] = str(value).lower()
+                    
+                    st.rerun()
+                else:
+                    st.session_state["password_correct"] = False
+                    st.error("😕 The password you’ve entered is incorrect.")
+            
+            st.markdown('<hr>', unsafe_allow_html=True)
+
+    return False
+
+def render_shrinkage_forecast_tab():
+    st.header("Shrinkage Forecast")
+    
+    title_col, clear_col = st.columns([0.8, 0.2])
+    with title_col:
+        st.subheader("1. Upload Shrinkage Data")
+    with clear_col:
+        st.write("")
+        if st.button("Clear 🗑️", key="clear_shrinkage_data", use_container_width=True):
+            keys_to_clear = ['shrink_uploader', 'shrink_horizon', 'shrink_show_graphs', 'shrinkage_results', 'manual_shrinkage_results']
+            for key in keys_to_clear:
+                if key in st.session_state: del st.session_state[key]
+            log_job_run("Shrinkage", "Cleared", "N/A", 0, "User cleared data for module.")
+            st.rerun()
+
+    with st.container(border=True):
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            uploaded_file = st.file_uploader("Upload Shrinkage Raw Excel Data", type=["xlsx", "xls"], key="shrink_uploader", label_visibility="collapsed")
+        with col2:
+            st.write("") 
+            st.write("")
+            shrink_template_df = pd.DataFrame({'Activity End Time (UTC) Date': [pd.Timestamp('2025-01-01')], 'Activity Start Time (UTC) Hour of Day': [8], 'Site Name': ['Queue_A'], 'Scheduled Paid Time (h)': [100.5], 'Absence Time [Planned] (h)': [8.0], 'Absence Time [Unplanned] (h)': [4.5]})
+            st.download_button(label="⬇️ Download Data Template", data=to_excel_bytes(shrink_template_df, index=False), file_name="shrinkage_template.xlsx", use_container_width=True)
+
+    if uploaded_file:
+        raw_data = pd.read_excel(uploaded_file)
+        with st.expander("📄 View Raw Data Preview", expanded=True):
+            st.dataframe(raw_data.head(), use_container_width=True, hide_index=True)
+        
+        with st.container(border=True):
+            st.subheader("2. Configure & Run Forecast")
+            form_cols = st.columns([1, 3])
+            with form_cols[0]:
+                horizon = st.number_input("Forecast Horizon (days)", 1, 90, 14, 1, key="shrink_horizon")
+            with form_cols[1]:
+                st.write("")
+                st.write("")
+                if st.button("🚀 Run Shrinkage Forecast", key="run_shrinkage", use_container_width=True):
+                    st.session_state.start_time = time.time()
+                    error_code = "N/A"; status = "Success"
+                    details = "N/A"
+                    
+                    progress_bar = st.progress(0, text="Starting shrinkage forecast...")
+
+                    try:
+                        processed_data = shrink_process_raw_data(raw_data)
+                        if processed_data is not None:
+                            forecasts = {}
+                            shrinkage_definitions = {'Total': 'Total_Shrinkage', 'Planned': 'Planned_Shrinkage', 'Unplanned': 'Unplanned_Shrinkage'}
+                            
+                            for i, (typ, col) in enumerate(shrinkage_definitions.items()):
+                                progress_bar.progress((i + 1) / len(shrinkage_definitions), text=f"Forecasting {typ} shrinkage...")
+                                daily_df, best_df, hist_map = shrink_run_forecasting(processed_data, int(horizon), col)
+                                interval_df = shrink_generate_interval_forecast(daily_df, processed_data, col)
+                                weekly_df, monthly_df = shrink_generate_aggregated_forecasts(daily_df)
+                                backtest_dict = {q: shrink_backtest_forecast(hist_map[q], horizon, best_df.loc[best_df['Queue']==q, 'Method'].iloc[0] if q in best_df['Queue'].values else 'Prophet') for q in hist_map if len(hist_map[q]) > horizon}
+                                forecasts[typ] = {"daily": daily_df, "best": best_df, "hist": hist_map, "interval": interval_df, "weekly": weekly_df, "monthly": monthly_df, "backtest": backtest_dict}
+                            
+                            st.session_state['shrinkage_results'] = {"forecasts": forecasts, "queues": processed_data["Queue"].unique(), "processed_data": processed_data, "types": ['Total', 'Planned', 'Unplanned'], "cols": shrinkage_definitions, "historical_min_date": processed_data.index.min().date(), "historical_max_date": processed_data.index.max().date()}
+                            
+                            details = "Shrinkage forecast completed successfully."
+
+                        else: status = "Error"; error_code = "ERR#2"
+                    except ValueError: status = "Error"; error_code = "ERR#2"; st.error("Data processing failed. Please check your Excel file."); details="Data processing failed. Please check your Excel file."
+                    except Exception as e: status = "Error"; error_code = "ERR#4"; st.error(f"An unexpected error occurred: {e}"); details=str(e)
+                    
+                    progress_bar.empty()
+                    log_job_run("Shrinkage Forecast", status, error_code, time.time() - st.session_state.start_time, details)
+                    if status == "Success": 
+                        st.success("Shrinkage forecast completed!")
+                        time.sleep(1)
+                    st.rerun()
+
+    if 'shrinkage_results' in st.session_state and st.session_state.shrinkage_results:
+        res = st.session_state.shrinkage_results
+        st.subheader("3. View Results")
+        with st.container(border=True):
+            st.markdown("**Global Display Filters**")
+            sel_type = st.radio("Shrinkage Type", res['types'], horizontal=True, key="global_shrinkage_type")
+            sel_queues = st.multiselect("Select Queues", ["All"] + list(res['queues']), default=["All"], key="global_queues")
+        
+        all_possible_queues = list(res['queues'])
+        
+        if "All" in sel_queues or (set(sel_queues) == set(all_possible_queues)):
+            queues_to_show = all_possible_queues
+        else:
+            queues_to_show = sel_queues
+
+        data = res['forecasts'][sel_type]; col = res['cols'][sel_type]
+
+        tab_hist, tab_monthly, tab_weekly, tab_daily, tab_comp, tab_manual = st.tabs(["Historical Patterns", "Monthly Summary", "Weekly Summary", "Daily Forecast", "Comparison", "Manual"])
+
+        with tab_hist:
+            with st.container(border=True):
+                st.header("Historical Shrinkage Patterns")
+                data_to_pivot = res['processed_data'][res['processed_data']['Queue'].isin(queues_to_show)]
+                if not data_to_pivot.empty:
+                    st.info(f"Displaying historical patterns for: **{', '.join(queues_to_show)}**")
+                    days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                    df_pivot = data_to_pivot.pivot_table(index=data_to_pivot.index.hour, columns=data_to_pivot.index.day_name(), values=col, aggfunc='mean')
+                    df_pivot = df_pivot.reindex(columns=days_order).fillna(0)
+                    st.dataframe(df_pivot.style.background_gradient(cmap='RdYlGn_r', axis=None).format("{:.2%}"), use_container_width=True)
+                    st.download_button("Download Pattern Table", to_excel_bytes(df_pivot), f"historical_pattern_{'_'.join(queues_to_show)}.xlsx")
+                else: st.warning("No data available for the selected queues.")
+                with st.expander("View Historical vs. Forecast Graph", expanded=st.session_state.get('shrink_show_graphs', False)):
+                    for q_graph in queues_to_show:
+                        if q_graph in data['hist'] and q_graph in data['daily']:
+                            fig = shrink_create_forecast_plot(data['hist'][q_graph], data['daily'][q_graph], q_graph, sel_type)
+                            st.plotly_chart(fig, use_container_width=True, key=f"hist_chart_{q_graph}")
+
+        with tab_monthly:
+            with st.container(border=True):
+                st.header("Monthly Forecast Summary"); df = data['monthly'][[q for q in queues_to_show if q in data['monthly'].columns]]
+                if not df.empty:
+                    st.dataframe(df.style.format("{:.2%}"), use_container_width=True)
+                    st.download_button("Download Monthly Forecast", to_excel_bytes(df), f"monthly_{sel_type}_forecast.xlsx")
+                    with st.expander("View Monthly Aggregated Graph", expanded=st.session_state.get('shrink_show_graphs', False)):
+                        hist_monthly = res['processed_data'][res['processed_data']['Queue'].isin(queues_to_show)].resample('M').mean(numeric_only=True)
+                        fig = shrink_create_aggregated_plot(hist_monthly[[col]], df.drop('Subtotal', errors='ignore'), 'Monthly', sel_type)
+                        st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No monthly forecast data to display for the selected queues.")
+                
+        with tab_weekly:
+            with st.container(border=True):
+                st.header("Weekly Forecast Summary"); df = data['weekly'][[q for q in queues_to_show if q in data['weekly'].columns]]
+                if not df.empty:
+                    st.dataframe(df.style.format("{:.2%}"), use_container_width=True)
+                    st.download_button("Download Weekly Forecast", to_excel_bytes(df), f"weekly_{sel_type}_forecast.xlsx")
+                    with st.expander("View Weekly Aggregated Graph", expanded=st.session_state.get('shrink_show_graphs', False)):
+                        hist_weekly = res['processed_data'][res['processed_data']['Queue'].isin(queues_to_show)].resample('W-MON').mean(numeric_only=True)
+                        fig = shrink_create_aggregated_plot(hist_weekly[[col]], df.drop('Subtotal', errors='ignore'), 'Weekly', sel_type)
+                        st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No weekly forecast data to display for the selected queues.")
+
+        with tab_daily:
+            with st.container(border=True):
+                st.header("Daily Forecast")
+                best_methods_df = data['best'][data['best']['Queue'].isin(queues_to_show)].copy()
+                if not best_methods_df.empty:
+                    st.subheader("Best Method Analysis")
+                    best_methods_df['Comments'] = best_methods_df['MAE'].apply(lambda x: get_significance_rating(x * 100, metric_type='mae'))
+                    best_methods_df_display = best_methods_df.copy()
+                    best_methods_df_display['MAE'] = best_methods_df_display['MAE'].map('{:.2%}'.format)
+                    st.dataframe(best_methods_df_display[['Queue', 'Method', 'MAE', 'Comments']], use_container_width=True, hide_index=True)
+                    st.download_button("Download Best Methods", to_excel_bytes(best_methods_df), "shrinkage_best_methods.xlsx")
+                else:
+                    st.info("No best method analysis to display for the selected queues.")
+
+                df_interval = data['interval'] if 'interval' in data and not data['interval'].empty else pd.DataFrame()
+                if not df_interval.empty and 'Queue' in df_interval.columns:
+                    df_interval = df_interval[df_interval['Queue'].isin(queues_to_show)]
+
+                if not df_interval.empty:
+                    st.subheader("Interval-Level Forecast")
+                    display_df_interval = df_interval.sort_values(by="Timestamp").tail(20)
+                    st.caption("Showing the latest 20 records. Use the download button for the full forecast.")
+                    
+                    format_dict = {
+                        'Planned_Shrinkage': '{:.2%}', 'Unplanned_Shrinkage': '{:.2%}',
+                        'Total_Shrinkage': '{:.2%}', 'Hist_Daily_Avg': '{:.2%}',
+                        f'Forecasted_{col}': '{:.2%}',
+                    }
+                    st.dataframe(display_df_interval.style.format(format_dict, na_rep='-'), use_container_width=True, hide_index=True)
+                    st.download_button("Download Full Interval Forecast Data", to_excel_bytes(df_interval), f"interval_{sel_type}_forecast.xlsx", key=f"download_interval_{sel_type}")
+                else: st.info("No interval-level data to display.")
+                with st.expander("View Daily Forecast Graphs", expanded=st.session_state.get('shrink_show_graphs', False)):
+                    for q_graph in queues_to_show:
+                        if q_graph in data['hist'] and q_graph in data['daily']:
+                            fig = shrink_create_forecast_plot(data['hist'][q_graph], data['daily'][q_graph], q_graph, sel_type)
+                            st.plotly_chart(fig, use_container_width=True, key=f"daily_chart_{q_graph}")
+
+        with tab_comp:
+            with st.container(border=True):
+                st.header("Shrinkage Comparison (Actual vs. Backtest Forecast)")
+                date_range = st.date_input("Select Date Range for Comparison", [res['historical_min_date'], res['historical_max_date']], min_value=res['historical_min_date'], max_value=res['historical_max_date'], key="comparison_date_range")
+                default_selection = [queues_to_show[0]] if len(queues_to_show) > 0 else []
+                q_comp = st.multiselect("Select Queue(s) for Backtest Comparison:", queues_to_show, default=default_selection)
+                
+                if q_comp:
+                    fig = go.Figure()
+                    for queue in q_comp:
+                        if queue in data['backtest']:
+                            forecasted, actual = data['backtest'][queue]
+                            if date_range and len(date_range) == 2:
+                                actual = actual[(actual.index.date >= date_range[0]) & (actual.index.date <= date_range[1])]
+                                forecasted = forecasted[(forecasted.index.date >= date_range[0]) & (forecasted.index.date <= date_range[1])]
+                            fig.add_trace(go.Scatter(x=actual.index, y=actual, mode='lines', name=f'Actual - {queue}'))
+                            fig.add_trace(go.Scatter(x=forecasted.index, y=forecasted, mode='lines', name=f'Forecast - {queue}', line=dict(dash='dash')))
+                    fig.update_layout(title=f"Backtest Comparison", yaxis=dict(tickformat=".1%"))
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                st.subheader("Download Historical Interval Data")
+                if date_range and len(date_range) == 2:
+                    filtered_processed_data = res['processed_data'][(res['processed_data'].index.date >= date_range[0]) & (res['processed_data'].index.date <= date_range[1]) & (res['processed_data']['Queue'].isin(queues_to_show))]
+                    st.download_button("Download Filtered Interval Data", to_excel_bytes(filtered_processed_data), f"historical_interval_{date_range[0]}_to_{date_range[1]}.xlsx", key="download_comp_interval")
+
+        with tab_manual:
+            with st.container(border=True):
+                st.header("Manual Shrinkage Forecasting")
+                with st.form("manual_shrinkage_form"):
+                    st.write("#### Configure Manual Forecast")
+                    horizon_manual = st.number_input("Forecast Horizon (days)", 1, 365, 30, key="manual_shrink_horizon")
+                    models_to_run = st.multiselect("Select models to run:", ["Seasonal Naive", "Moving Average", "Prophet"], default=["Seasonal Naive"])
+                    submitted_manual = st.form_submit_button("🚀 Run Manual Shrinkage Forecast")
+
+                if submitted_manual:
+                    if not models_to_run:
+                        st.error("Please select at least one model to run.")
+                    else:
+                        manual_forecasts = {}
+                        queues_manual = res['processed_data']['Queue'].unique()
+                        
+                        with st.spinner("Running manual forecast..."):
+                            for q in queues_manual:
+                                ts = res['processed_data'][res['processed_data']["Queue"] == q][col].resample('D').mean().fillna(0)
+                                if ts.empty: continue
+
+                                for model_name in models_to_run:
+                                    try:
+                                        if model_name == "Seasonal Naive":
+                                            forecast = shrink_forecast_seasonal_naive(ts, horizon_manual)
+                                        elif model_name == "Moving Average":
+                                            forecast = shrink_forecast_moving_average(ts, horizon_manual)
+                                        elif model_name == "Prophet":
+                                            forecast = shrink_forecast_prophet(ts, horizon_manual)
+                                        
+                                        if not forecast.empty:
+                                            manual_forecasts[(q, model_name)] = forecast
+                                    except Exception as e:
+                                        st.warning(f"Model '{model_name}' failed for queue '{q}': {e}")
+                        st.session_state.manual_shrinkage_results = pd.DataFrame(manual_forecasts)
+
+                manual_results = st.session_state.get('manual_shrinkage_results')
+                if manual_results is not None and not manual_results.empty:
+                    st.subheader("Manual Forecast Results")
+                    df_manual = st.session_state.manual_shrinkage_results
+                    st.dataframe(df_manual.style.format("{:.2%}"), use_container_width=True)
+                    st.download_button("Download Manual Forecast", to_excel_bytes(df_manual), "manual_shrinkage_forecast.xlsx")
 
 def render_volume_forecast_tab():
-    """Renders the Volume Forecast UI, with separate sub-tabs for monthly and daily forecasts."""
     st.header("📦 Volume Forecast Engine")
     
-    with st.container(border=True):
+    title_col, clear_col = st.columns([0.8, 0.2])
+    with title_col:
         st.subheader("1. Upload Volume Data")
+    with clear_col:
+        st.write("")
+        if st.button("Clear 🗑️", key="clear_volume_data", use_container_width=True):
+            keys_to_clear = ['vol_uploader', 'm_horizon', 'd_horizon', 'df_volume_ready', 'df_volume_original', 'volume_monthly_results', 'volume_daily_results', 'manual_volume_results', 'backtest_volume_results']
+            for key in keys_to_clear:
+                if key in st.session_state: del st.session_state[key]
+            log_job_run("Volume", "Cleared", "N/A", 0, "User cleared data for module.")
+            st.rerun()
+
+    with st.container(border=True):
         col_uploader, col_template = st.columns([3,1])
         with col_uploader:
             uploaded_file = st.file_uploader("Upload Volume Raw Excel Data", type=["xlsx", "xls"], key="vol_uploader", label_visibility="collapsed")
@@ -1068,22 +1445,19 @@ def render_volume_forecast_tab():
                 with form_cols[1]:
                     st.write("")
                     st.write("")
-                    if st.button("🚀 Run Monthly Volume Forecast", key="run_vol_month", use_container_width=True):
-                        with st.spinner("🚀 Running monthly forecast competition... This may take a moment."):
-                            st.session_state.start_time = time.time()
-                            all_fc, err, best_fc, best_methods, _ = vol_run_monthly_forecasting(st.session_state.df_volume_original, horizon_m)
-                            
-                            if best_fc.empty:
-                                st.info("ℹ️ No forecast could be generated. This often happens if the uploaded data has insufficient history for every queue (e.g., less than 3 months).")
-                                log_job_run("Monthly Volume", "Failed", "ERR#1", time.time() - st.session_state.start_time)
-                            else:
-                                st.session_state.volume_monthly_results = { "all_forecasts_df": all_fc, "error_df": err, "best_forecast_df": best_fc, "best_methods_df": best_methods, "original_df": df_prep }
-                                ts_str = datetime.now().strftime("%Y%m%d_%H%M%S_Monthly")
-                                log_job_run("Monthly Volume", "Success", "N/A", time.time() - st.session_state.start_time, ts_str)
-                                vol_archive_run_results(ts_str, st.session_state.volume_monthly_results, "Monthly")
-                                st.success("Monthly forecast competition complete!")
-                                time.sleep(1)
-                                st.rerun()
+                    if st.button("🚀 Run Monthly Volume Forecast", use_container_width=True):
+                        st.session_state.start_time = time.time()
+                        all_fc, err, best_fc, best_methods, _ = vol_run_monthly_forecasting(st.session_state.df_volume_original, horizon_m)
+                        
+                        if best_fc.empty:
+                            st.info("ℹ️ No forecast could be generated. This often happens if the uploaded data has insufficient history for every queue (e.g., less than 3 months).")
+                            log_job_run("Monthly Volume", "Failed", "ERR#1", time.time() - st.session_state.start_time, "Insufficient data for forecasting.")
+                        else:
+                            st.session_state.volume_monthly_results = { "all_forecasts_df": all_fc, "error_df": err, "best_forecast_df": best_fc, "best_methods_df": best_methods, "original_df": df_prep }
+                            log_job_run("Monthly Volume", "Success", "N/A", time.time() - st.session_state.start_time, "Monthly forecast completed.")
+                            st.success("Monthly forecast competition complete!")
+                            time.sleep(1)
+                            st.rerun()
 
             if 'volume_monthly_results' in st.session_state and st.session_state.volume_monthly_results:
                 res = st.session_state.volume_monthly_results
@@ -1127,11 +1501,10 @@ def render_volume_forecast_tab():
                             dl_cols[0].download_button("Forecast (Monthly)", to_excel_bytes(res['best_forecast_df'][[queue]]), f"monthly_fc_{queue}.xlsx", key=f"dl_m_fc_{queue}")
                             dl_cols[1].download_button("Forecast (Interval)", to_excel_bytes(interval_fc_monthly), f"monthly_interval_{queue}.xlsx", key=f"dl_m_int_{queue}")
                             if not res['best_methods_df'].empty:
-                               dl_cols[2].download_button("Winning Method", to_excel_bytes(res['best_methods_df'].loc[[queue]]), f"monthly_winner_{queue}.xlsx", key=f"dl_m_win_{queue}")
+                                dl_cols[2].download_button("Winning Method", to_excel_bytes(res['best_methods_df'].loc[[queue]]), f"monthly_winner_{queue}.xlsx", key=f"dl_m_win_{queue}")
                             if not res['error_df'].empty:
-                               dl_cols[3].download_button("All Errors", to_excel_bytes(res['error_df'][res['error_df']['Queue']==queue]), f"monthly_errors_{queue}.xlsx", key=f"dl_m_err_{queue}")
+                                dl_cols[3].download_button("All Errors", to_excel_bytes(res['error_df'][res['error_df']['Queue']==queue]), f"monthly_errors_{queue}.xlsx", key=f"dl_m_err_{queue}")
 
-        
         with daily_tab:
             with st.container(border=True):
                 st.subheader("2. Daily Forecast Configuration")
@@ -1143,21 +1516,18 @@ def render_volume_forecast_tab():
                 with form_cols_d[2]:
                     st.write(""); st.write("")
                     if st.button("🚀 Run Daily Volume Forecast", use_container_width=True):
-                        with st.spinner("🚀 Running daily forecast competition... This may take a moment."):
-                            st.session_state.start_time = time.time()
-                            all_fc, err, best_fc, best_methods, _ = vol_run_daily_forecasting(st.session_state.df_volume_original, horizon_d, COUNTRY_CODES[country])
-                            
-                            if best_fc.empty:
-                                st.info("ℹ️ No forecast could be generated. This often happens if the uploaded data has insufficient history for every queue (e.g., less than 14 days).")
-                                log_job_run("Daily Volume", "Failed", "ERR#1", time.time() - st.session_state.start_time)
-                            else:
-                                st.session_state.volume_daily_results = { "all_forecasts_df": all_fc, "error_df": err, "best_forecast_df": best_fc, "best_methods_df": best_methods, "original_df": df_prep }
-                                ts_str = datetime.now().strftime("%Y%m%d_%H%M%S_Daily")
-                                log_job_run("Daily Volume", "Success", "N/A", time.time() - st.session_state.start_time, ts_str)
-                                vol_archive_run_results(ts_str, st.session_state.volume_daily_results, "Daily")
-                                st.success("Daily forecast complete!")
-                                time.sleep(1)
-                                st.rerun()
+                        st.session_state.start_time = time.time()
+                        all_fc, err, best_fc, best_methods, _ = vol_run_daily_forecasting(st.session_state.df_volume_original, horizon_d, COUNTRY_CODES[country])
+                        
+                        if best_fc.empty:
+                            st.info("ℹ️ No forecast could be generated. This often happens if the uploaded data has insufficient history for every queue (e.g., less than 14 days).")
+                            log_job_run("Daily Volume", "Failed", "ERR#1", time.time() - st.session_state.start_time, "Insufficient data for forecasting.")
+                        else:
+                            st.session_state.volume_daily_results = { "all_forecasts_df": all_fc, "error_df": err, "best_forecast_df": best_fc, "best_methods_df": best_methods, "original_df": df_prep }
+                            log_job_run("Daily Volume", "Success", "N/A", time.time() - st.session_state.start_time, "Daily forecast completed.")
+                            st.success("Daily forecast complete!")
+                            time.sleep(1)
+                            st.rerun()
 
             if 'volume_daily_results' in st.session_state and st.session_state.volume_daily_results:
                 res = st.session_state.volume_daily_results
@@ -1203,8 +1573,8 @@ def render_volume_forecast_tab():
                             dl_cols[1].download_button("Forecast (Weekly)", to_excel_bytes(weekly_fc), f"weekly_fc_{queue}.xlsx", key=f"dl_d_wk_{queue}")
                             dl_cols[2].download_button("Forecast (Interval)", to_excel_bytes(interval_fc[interval_fc['Queue']==queue]), f"interval_fc_{queue}.xlsx", key=f"dl_d_int_{queue}")
                             if not res['best_methods_df'].empty:
-                               dl_cols[3].download_button("Winning Method", to_excel_bytes(res['best_methods_df'].loc[[queue]]), f"daily_winner_{queue}.xlsx", key=f"dl_d_win_{queue}")
-
+                                dl_cols[3].download_button("Winning Method", to_excel_bytes(res['best_methods_df'].loc[[queue]]), f"daily_winner_{queue}.xlsx", key=f"dl_d_win_{queue}")
+        
         with manual_tab:
             st.header("🛠️ Manual Volume Forecast")
             if 'df_volume_ready' in st.session_state:
@@ -1279,7 +1649,6 @@ def render_volume_forecast_tab():
                 queue_bt_choice = st.selectbox("Select Queue to Backtest:", queues_bt)
                 time_unit_bt = st.radio("Select Backtesting Frequency:", ["Daily", "Monthly"], horizontal=True)
                 
-                # FIX: Expanded backtesting model options
                 if time_unit_bt == "Daily":
                     models_bt = {
                         "Seasonal Naive (7d)": lambda ts, h: vol_forecast_seasonal_naive(ts, h, freq='D', seasonal_periods=7),
@@ -1334,112 +1703,484 @@ def render_volume_forecast_tab():
                     dl_bt_cols[1].download_button("Download Interval Results", to_excel_bytes(interval_bt_df), "backtest_interval.xlsx")
             else:
                 st.warning("Please upload a file to enable backtesting.")
+            
+def render_capacity_planning_tab():
+    st.header("⚙️ Capacity Planning Modeler")
 
+    title_col, clear_col = st.columns([0.8, 0.2])
+    with title_col:
+        st.subheader("1. Input Parameters")
+    with clear_col:
+        st.write("")
+        if st.button("Clear 🗑️", key="clear_capacity_data", use_container_width=True):
+            if 'capacity_model_results' in st.session_state: del st.session_state['capacity_model_results']
+            log_job_run("Capacity", "Cleared", "N/A", 0, "User cleared data for module.")
+            st.rerun()
 
+    FTE_OPT_NAME = "FTE (OR Tool)"
+    MONTE_CARLO_NAME = "Monte Carlo (HC)"
 
-# --- SECTION 6: MAIN APPLICATION EXECUTION ---
-if __name__ == "__main__":
-    initialize_session_state()
-
-    st.markdown("""
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600&display=swap');
+    with st.container(border=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            login_hours = st.number_input("Login Hours per FTE", 0.1, 24.0, 8.0, 0.1)
+            volume = st.number_input("Primary Task Volume", 0, 100000, 5000)
+            aht_seconds = st.number_input("Primary Task AHT (s)", 1, 3600, 300)
+        with c2:
+            occupancy = st.number_input("Target Occupancy (%)", 1.0, 100.0, 85.0, 0.5, "%.1f", help="Affects the Workload model only.")
+            sla_target_percent = st.slider("SLA Target (%)", 1, 100, 80)
+            sla_value_seconds = st.number_input("Target Service Time (s)", 1, 600, 30)
+            st.caption("These targets affect the Erlang C and Monte Carlo models.")
+        with c3:
+            concurrency = st.number_input("Concurrency", 1.0, 10.0, 1.0, 0.1, "%.1f", help="Number of simultaneous tasks an agent can handle.")
+            
+        with st.expander(f"🧠 Show Advanced Inputs (for {FTE_OPT_NAME})"):
+            c4, c5 = st.columns(2)
+            with c4:
+                email_volume = st.number_input("Secondary Task Volume", 0, 100000, 2000)
+                email_aht_sec = st.number_input("Secondary Task AHT (s)", 1, 3600, 900)
+            with c5:
+                cost_primary = st.number_input("Primary Skill Cost ($)", 0, 10000, 800)
+                cost_secondary = st.number_input("Secondary Skill Cost ($)", 0, 10000, 750)
+                cost_blended = st.number_input("Blended Skill Cost ($)", 0, 10000, 950)
+        st.markdown("---")
         
-        html, body, [class*="st-"], [class*="css-"] {
-            font-family: 'Poppins', sans-serif; 
-            font-weight: 300;
-        }
-        /* FIX: Changed main background to white */
-        .stApp { background-color: #FFFFFF; } 
+        models_to_run = st.multiselect(
+            "Select Models to Run",
+            ["Workload", "Erlang C", MONTE_CARLO_NAME, FTE_OPT_NAME],
+            default=["Workload", "Erlang C", MONTE_CARLO_NAME, FTE_OPT_NAME]
+        )
+        
+        if st.button("🚀 Run Capacity Models", use_container_width=True):
+            results = {}
+            progress_bar = st.progress(0, text="Starting capacity modeling...")
+            total_models = len(models_to_run)
+            
+            for i, model_name in enumerate(models_to_run):
+                progress_text = f"Running {model_name} model..."
+                progress_bar.progress((i + 1) / total_models, text=progress_text)
+                time.sleep(0.1)
+                
+                if model_name == "Workload":
+                    results['Workload'] = run_workload_model(login_hours, aht_seconds, volume, occupancy, concurrency)
+                elif model_name == "Erlang C":
+                    results['Erlang C'] = run_erlang_c_model(login_hours, aht_seconds, volume, sla_target_percent, sla_value_seconds, concurrency)
+                elif model_name == MONTE_CARLO_NAME:
+                    results[MONTE_CARLO_NAME] = run_monte_carlo_hc_model(login_hours, aht_seconds, volume, sla_target_percent, sla_value_seconds, concurrency)
+                elif model_name == FTE_OPT_NAME:
+                    model_inputs = {
+                        'call_volume': volume, 'call_aht_sec': aht_seconds, 'cost_voice': cost_primary,
+                        'email_volume': email_volume, 'email_aht_sec': email_aht_sec, 'cost_email': cost_secondary,
+                        'cost_blended': cost_blended, 'hours_per_fte': login_hours, 'concurrency': concurrency
+                    }
+                    results[FTE_OPT_NAME] = run_fte_optimization_model(model_inputs)
+            
+            st.session_state.capacity_model_results = results
+            progress_bar.empty()
 
-        /* Main Tabs */
-        .stTabs [data-baseweb="tab-list"] { 
-            gap: 10px; 
-            border-bottom: 2px solid #E0E0E0;
-        }
-        .stTabs [data-baseweb="tab"] { 
-            height: auto;
-            padding: 10px 18px; 
-            font-size: 15px;
-            font-weight: 400;
-            background-color: #F0F2F5; 
-            border-radius: 8px 8px 0 0;
-            border: 1px solid #E0E0E0;
-            margin-bottom: -2px;
-        }
-        .stTabs [aria-selected="true"] { 
-            background-color: #FFFFFF;
-            color: #1a1a1a;
-            font-weight: 600;
-            border-bottom: 2px solid #FFFFFF;
+    if st.session_state.get('capacity_model_results'):
+        st.subheader("2. Model Results")
+        results = st.session_state.capacity_model_results
+        
+        for model_name, model_output in results.items():
+            model_output["Target ASA (s)"] = sla_value_seconds
+            if "Avg Wait (s)" not in model_output: model_output["Avg Wait (s)"] = "N/A"
+            if "Predicted SL (%)" not in model_output and "Predicted SLA (%)" not in model_output: model_output["Predicted SLA (%)"] = "N/A"
+        
+        res_cols = st.columns(len(results))
+        for i, (model_name, model_output) in enumerate(results.items()):
+            with res_cols[i]:
+                with st.container(border=True):
+                    st.markdown(f"**{model_name}**")
+                    metric_order = ["Required FTE", "Required HC", "Total FTE", "Predicted SLA (%)", "Predicted SL (%)", "Target ASA (s)", "Avg Wait (s)", "Minimum Cost ($)"]
+                    for key in metric_order:
+                        if key in model_output:
+                            st.metric(label=key, value=model_output[key])
+        
+        st.markdown("---")
+        
+        st.subheader("💡 Model Recommendation Analysis")
+        summary_data = []
+        model_comments = {
+            "Workload": "⚠️ Lowest cost, highest service risk. Use as a baseline only.",
+            "Erlang C": "⭐⭐ Industry standard. A great balance of cost and service.",
+            MONTE_CARLO_NAME: "⭐⭐⭐ Most robust/conservative. Recommended for high-certainty planning.",
+            FTE_OPT_NAME: "ℹ️ Best for cost optimization across multiple skills."
         }
         
-        /* Metric Cards */
-        [data-testid="stMetric"] {
-            background-color: #F8F9FA;
-            border: 1px solid #EAEAEA;
-            border-radius: 10px;
-            padding: 15px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.04);
-        }
+        if "Workload" in results:
+            summary_data.append({
+                "Model": "Workload", "Required HC/FTE": results["Workload"].get("Required FTE", "N/A"),
+                "Key Metric": f"{occupancy}% Occupancy", "Comments": model_comments["Workload"]
+            })
+        if "Erlang C" in results:
+            summary_data.append({
+                "Model": "Erlang C", "Required HC/FTE": results["Erlang C"].get("Required HC", "N/A"),
+                "Key Metric": f"{results['Erlang C'].get('Predicted SL (%)', 0)}% SL", "Comments": model_comments["Erlang C"]
+            })
+        if MONTE_CARLO_NAME in results:
+            summary_data.append({
+                "Model": MONTE_CARLO_NAME, "Required HC/FTE": results[MONTE_CARLO_NAME].get("Required HC", "N/A"),
+                "Key Metric": f"{results[MONTE_CARLO_NAME].get('Predicted SLA (%)', 0)}% SLA", "Comments": model_comments[MONTE_CARLO_NAME]
+            })
+        if FTE_OPT_NAME in results and "Error" not in results[FTE_OPT_NAME]:
+            summary_data.append({
+                "Model": FTE_OPT_NAME, "Required HC/FTE": results[FTE_OPT_NAME].get("Total FTE", "N/A"),
+                "Key Metric": results[FTE_OPT_NAME].get("Minimum Cost ($)", "N/A"), "Comments": model_comments[FTE_OPT_NAME]
+            })
 
-    </style>
-    """, unsafe_allow_html=True)
+        if summary_data:
+            summary_df = pd.DataFrame(summary_data)
+            
+            sl_models = []
+            if "Erlang C" in results: sl_models.append({"name": "Erlang C", "hc": results["Erlang C"].get("Required HC", float('inf'))})
+            if MONTE_CARLO_NAME in results: sl_models.append({"name": MONTE_CARLO_NAME, "hc": results[MONTE_CARLO_NAME].get("Required HC", float('inf'))})
 
+            recommended_model = ""
+            if sl_models:
+                best_model = min(sl_models, key=lambda x: x['hc'])
+                recommended_model = best_model['name']
+                
+            def highlight_recommendation(row):
+                if row.Model == recommended_model:
+                    return ['background-color: #BDE5F8'] * len(row)
+                return [''] * len(row)
+            
+            st.dataframe(
+                summary_df.style.apply(highlight_recommendation, axis=1), hide_index=True, use_container_width=True
+            )
+            if recommended_model:
+                st.caption(f"✅ The highlighted row is the most efficient model that meets the SLA target.")
 
-    if not check_password():
-        st.stop()
-
-    with st.container():
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            st.image("https://cdn.worldvectorlogo.com/logos/wise-2.svg", width=150)
-        with col2:
-            st.markdown("<h1 style='text-align: center; color: black; font-weight:600;'>WiseInsights</h1>", unsafe_allow_html=True)
-            welcome_name = st.session_state.get("username", "User").capitalize()
-            st.markdown(f"<p style='text-align: center;'>Welcome, {welcome_name}! Today is {datetime.now().strftime('%A, %B %d, %Y')}.</p>", unsafe_allow_html=True)
-
+        results_df = pd.DataFrame.from_dict(results).transpose()
+        st.download_button(
+            label="⬇️ Download All Model Results", data=to_excel_bytes(results_df, index=True),
+            file_name="capacity_model_results.xlsx", mime="application/vnd.ms-excel"
+        )
+def render_monthly_capacity_planner_tab():
+    st.header("🗓️ Monthly Capacity Planner")
     st.markdown("---")
 
-    with st.sidebar:
-        st.header("🛠️ Controls & Archives")
-        st.info(f"Logged in as: **{welcome_name}**")
-        if st.button("Logout"):
-            for key in st.session_state.keys(): del st.session_state[key]
-            st.rerun()
-        st.markdown("---")
-        st.subheader("📜 Run History")
-        
-        if st.session_state.run_history:
-            history_df = pd.DataFrame(st.session_state.run_history)
-            st.dataframe(history_df, use_container_width=True, hide_index=True,
-                column_config={ "Time Took (s)": st.column_config.NumberColumn("Time (s)", width="small") }
-            )
-            for i, run in enumerate(st.session_state.run_history):
-                if run["Archive File"] != "N/A":
-                    zip_data = vol_create_zip_for_run(run["Archive File"])
-                    if zip_data:
-                        st.download_button(f"Download Archive for Job {i+1}", zip_data, f"vol_archive_{run['Archive File']}.zip", key=f"dl_archive_{i}")
-        else:
-            st.info("No jobs have been run in this session.")
+    # --- 1. Check for required forecast data ---
+    if 'volume_monthly_results' not in st.session_state or st.session_state.volume_monthly_results is None:
+        st.warning("Please run a Monthly Volume Forecast from the Volume tab first to enable this feature.")
+        return
 
-        if st.button("🗑️ Clear All History & Archives"):
-            st.session_state.run_history = []
-            if os.path.exists(VOL_ARCHIVE_DIR): shutil.rmtree(VOL_ARCHIVE_DIR)
-            os.makedirs(VOL_ARCHIVE_DIR, exist_ok=True)
-            for key in ['volume_monthly_results', 'volume_daily_results', 'shrinkage_results', 'manual_shrinkage_results']:
-                if key in st.session_state: st.session_state[key] = None
-            st.rerun()
-            
-        st.markdown("---")
-        st.subheader("📖 Error Code Legend")
-        error_data = { "Code": ["ERR#1", "ERR#2", "ERR#3", "ERR#4"], "Meaning": ["Low Data Volume", "Data Processing Error", "Forecast Model Failure", "Unknown Code Error"] }
-        st.table(pd.DataFrame(error_data))
+    # --- 2. Load and Prepare Data ---
+    monthly_volume_forecast = st.session_state.volume_monthly_results['best_forecast_df']
+    all_queues = sorted(list(monthly_volume_forecast.columns))
     
-    shrinkage_tab, volume_tab = st.tabs(["👥 Shrinkage Forecast", "📦 Volume Forecast"])
-    with shrinkage_tab:
-        render_shrinkage_forecast_tab()
-    with volume_tab:
-        render_volume_forecast_tab()
+    if 'shrinkage_results' in st.session_state and st.session_state.shrinkage_results is not None:
+        shrinkage_forecast = st.session_state.shrinkage_results['forecasts']['Total']['monthly']
+    else:
+        shrinkage_forecast = pd.DataFrame(index=monthly_volume_forecast.index, columns=all_queues).fillna(0)
 
-    st.markdown("<hr><footer style='text-align:center;color:#94a3b8;'>Powered by PayOps WFM | One App to Rule Them All</footer>", unsafe_allow_html=True)
+    # --- 3. Load Saved Plan ---
+    saved_plans = get_saved_plan_names()
+    selected_plan_to_load = st.selectbox("Load Saved Plan (Optional)", [""] + saved_plans, key="load_plan_selector")
+    
+    # Logic to handle loading a plan
+    if selected_plan_to_load and st.session_state.get('loaded_plan_name') != selected_plan_to_load:
+        plan_details = load_capacity_plan(selected_plan_to_load)
+        if plan_details:
+            st.session_state.loaded_plan_name = selected_plan_to_load
+            st.session_state.capacity_plan_inputs = plan_details['plan_data']
+            st.session_state.loaded_queues = plan_details['queues']
+            st.session_state.loaded_start_month = plan_details['start_month']
+            st.success(f"Successfully loaded plan: '{selected_plan_to_load}'")
+            st.rerun()
+
+    # --- 4. User Filters for Month and Queue ---
+    filter_cols = st.columns([1, 2])
+    available_months = monthly_volume_forecast.index.tolist()
+    
+    start_month_default_index = available_months.index(st.session_state.get('loaded_start_month', available_months[0]))
+    queues_default = st.session_state.get('loaded_queues', [all_queues[0]] if all_queues else [])
+
+    start_month = filter_cols[0].selectbox("Select Start Month", options=available_months, index=start_month_default_index)
+    selected_queues = filter_cols[1].multiselect("Select Queues to Plan", options=all_queues, default=queues_default)
+
+    if not selected_queues:
+        st.info("Please select at least one queue to view the capacity plan.")
+        return
+
+    # --- 5. Initialize and Build the Main Planner DataFrame ---
+    plan_dates = pd.date_range(start=pd.to_datetime(start_month, format='%b-%y'), periods=12, freq='MS')
+    plan_months_str = [d.strftime('%b-%y') for d in plan_dates]
+
+    plan_structure = [
+        "Opening Headcount", "New Hires", "Attrition %", "Attrition HC", "Ending Headcount", "HC in Training", "HC in Nesting", "Productive Headcount",
+        "HC - Tenure <1 Month", "AHT - Tenure <1 Month (s)", "HC - Tenure 1-3 Months", "AHT - Tenure 1-3 Months (s)", "HC - Tenure >3 Months", "AHT - Tenure >3 Months (s)", "Blended AHT (s)",
+        "Forecasted Volume", "Working Days", "Monthly Login Hours", "Target Occupancy (%)", "Target SLA (%)", "Target ASA (s)",
+        "Forecasted Shrinkage (%)", "Shift Inflex (%)", "Total Shrinkage (%)",
+        "Workload Required HC", "Erlang C Required HC", "Monte Carlo Required HC",
+        "Over/Under (Workload)", "Over/Under (Erlang C)", "Over/Under (Monte Carlo)"
+    ]
+    plan_df = pd.DataFrame(0, index=plan_structure, columns=plan_months_str)
+
+    # --- 6. Populate Data and Default Inputs ---
+    vol_plan = monthly_volume_forecast.reindex(plan_months_str).ffill()
+    shrink_plan = shrinkage_forecast.reindex(plan_months_str).ffill()
+    
+    plan_df.loc["Forecasted Volume"] = vol_plan[selected_queues].sum(axis=1)
+    plan_df.loc["Forecasted Shrinkage (%)"] = shrink_plan[selected_queues].mean(axis=1)
+
+    # Load data from session state if it exists, otherwise set defaults
+    input_key = "-".join(sorted(selected_queues))
+    saved_inputs = st.session_state.get('capacity_plan_inputs', {}).get(input_key, {})
+
+    editable_rows = {
+        "Opening Headcount": 100, "New Hires": 10, "Attrition %": 0.05, "HC in Training": 5, "HC in Nesting": 5,
+        "HC - Tenure <1 Month": 10, "AHT - Tenure <1 Month (s)": 600, "HC - Tenure 1-3 Months": 20, "AHT - Tenure 1-3 Months (s)": 450,
+        "HC - Tenure >3 Months": 70, "AHT - Tenure >3 Months (s)": 300, "Working Days": 21, "Monthly Login Hours": 160,
+        "Target Occupancy (%)": 85, "Target SLA (%)": 80, "Target ASA (s)": 20, "Shift Inflex (%)": 0.05
+    }
+
+    for row, default_val in editable_rows.items():
+        for month in plan_months_str:
+            plan_df.loc[row, month] = saved_inputs.get(month, {}).get(row, default_val)
+
+    # --- 7. Create Interactive Data Editor ---
+    st.info("💡 You can edit the white cells directly in the table below. Calculations will update automatically.")
+    
+    edited_df = st.data_editor(plan_df, use_container_width=True)
+
+    # --- 8. Perform All Calculations Based on Edited Data ---
+    # (This section re-calculates everything based on the user's edits in the table)
+    for i, month in enumerate(plan_months_str):
+        # Headcount Flow
+        if i > 0:
+            edited_df.loc["Opening Headcount", month] = edited_df.loc["Ending Headcount", plan_months_str[i-1]]
+        edited_df.loc["Attrition HC", month] = -np.floor(edited_df.loc["Opening Headcount", month] * edited_df.loc["Attrition %", month])
+        edited_df.loc["Ending Headcount", month] = edited_df.loc["Opening Headcount", month] + edited_df.loc["New Hires", month] + edited_df.loc["Attrition HC", month]
+        edited_df.loc["Productive Headcount", month] = edited_df.loc["Ending Headcount", month] - edited_df.loc["HC in Training", month] - edited_df.loc["HC in Nesting", month]
+
+        # AHT Bell Curve
+        total_hc = edited_df.loc["HC - Tenure <1 Month", month] + edited_df.loc["HC - Tenure 1-3 Months", month] + edited_df.loc["HC - Tenure >3 Months", month]
+        if total_hc > 0:
+            weighted_aht = ((edited_df.loc["HC - Tenure <1 Month", month] * edited_df.loc["AHT - Tenure <1 Month (s)", month]) + (edited_df.loc["HC - Tenure 1-3 Months", month] * edited_df.loc["AHT - Tenure 1-3 Months (s)", month]) + (edited_df.loc["HC - Tenure >3 Months", month] * edited_df.loc["AHT - Tenure >3 Months (s)", month])) / total_hc
+            edited_df.loc["Blended AHT (s)", month] = weighted_aht
+        else:
+            edited_df.loc["Blended AHT (s)", month] = 0
+
+        # Total Shrinkage
+        edited_df.loc["Total Shrinkage (%)", month] = edited_df.loc["Forecasted Shrinkage (%)", month] + edited_df.loc["Shift Inflex (%)", month]
+
+        # Required HC Calculations
+        inputs = edited_df[month]
+        work_days = inputs["Working Days"] if inputs["Working Days"] > 0 else 1
+        daily_hours = inputs["Monthly Login Hours"] / work_days
+        daily_vol = inputs["Forecasted Volume"] / work_days
+        net_shrink_factor = 1 - inputs["Total Shrinkage (%)"]
+
+        workload_req = ((daily_vol * inputs["Blended AHT (s)"]) / 3600) / (daily_hours * (inputs["Target Occupancy (%)"] / 100))
+        edited_df.loc["Workload Required HC", month] = math.ceil(workload_req / net_shrink_factor) if net_shrink_factor < 1 else math.ceil(workload_req)
+        
+        erlang_res = run_erlang_c_model(daily_hours, inputs["Blended AHT (s)"], daily_vol, inputs["Target SLA (%)"], inputs["Target ASA (s)"], 1)
+        edited_df.loc["Erlang C Required HC", month] = math.ceil(erlang_res.get("Required HC", 0) / net_shrink_factor) if net_shrink_factor < 1 else math.ceil(erlang_res.get("Required HC", 0))
+
+        mc_res = run_monte_carlo_hc_model(daily_hours, inputs["Blended AHT (s)"], daily_vol, inputs["Target SLA (%)"], inputs["Target ASA (s)"], 1)
+        edited_df.loc["Monte Carlo Required HC", month] = math.ceil(mc_res.get("Required HC", 0) / net_shrink_factor) if net_shrink_factor < 1 else math.ceil(mc_res.get("Required HC", 0))
+
+        # Over/Under
+        edited_df.loc["Over/Under (Workload)", month] = edited_df.loc["Productive Headcount", month] - edited_df.loc["Workload Required HC", month]
+        edited_df.loc["Over/Under (Erlang C)", month] = edited_df.loc["Productive Headcount", month] - edited_df.loc["Erlang C Required HC", month]
+        edited_df.loc["Over/Under (Monte Carlo)", month] = edited_df.loc["Productive Headcount", month] - edited_df.loc["Monte Carlo Required HC", month]
+
+    # --- 9. Display Final Table and Save Option ---
+    st.dataframe(edited_df.style.format("{:,.2f}", na_rep='-'), use_container_width=True)
+
+    st.download_button(
+        label=f"⬇️ Download Plan for {', '.join(selected_queues)}",
+        data=to_excel_bytes(edited_df),
+        file_name=f"monthly_capacity_plan_{'_'.join(selected_queues)}.xlsx"
+    )
+
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("Save Current Plan")
+        plan_name_to_save = st.text_input("Enter Plan Name to Save")
+        if st.button("Save Plan"):
+            if plan_name_to_save:
+                # Extract only the editable data for saving
+                data_to_save = edited_df.loc[editable_rows.keys()].to_dict()
+                result = save_capacity_plan(plan_name_to_save, selected_queues, start_month, data_to_save)
+                if result is True:
+                    st.sidebar.success(f"Plan '{plan_name_to_save}' saved!")
+                    st.cache_data.clear()
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.sidebar.error(result)
+            else:
+                st.sidebar.warning("Please enter a name for the plan.")
+    
+def render_admin_tab():
+    st.header("👤 User & Permissions Management")
+    
+    if st.session_state.get('role', '').lower() != 'admin':
+        st.error("You do not have permission to access this page.")
+        return
+
+    users_df = get_all_users()
+    users_df['can_view_shrinkage'] = users_df['can_view_shrinkage'].apply(lambda x: 'yes' if x == 1 else 'no')
+    users_df['can_view_volume'] = users_df['can_view_volume'].apply(lambda x: 'yes' if x == 1 else 'no')
+    users_df['can_view_capacity'] = users_df['can_view_capacity'].apply(lambda x: 'yes' if x == 1 else 'no')
+    users_df['can_manage_schedules'] = users_df['can_manage_schedules'].apply(lambda x: 'yes' if x == 1 else 'no')
+    
+    st.subheader("Existing Users")
+    st.dataframe(users_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Add/Edit User")
+    with st.form("user_management_form"):
+        selected_user = st.selectbox("Select User to Edit (or select None for new user)", options=['None'] + list(users_df['username'].unique()))
+        
+        is_new_user = selected_user == 'None'
+        current_user_data = users_df[users_df['username'] == selected_user].iloc[0] if not is_new_user else {}
+
+        username = st.text_input("Username", value=current_user_data.get('username', ''), disabled=not is_new_user)
+        password = st.text_input("Password (leave blank to keep current)", type="password")
+        role = st.selectbox("Role", options=['Admin', 'Manager', 'Agent'], index=['Admin', 'Manager', 'Agent'].index(current_user_data.get('role', 'Agent')))
+        
+        st.markdown("---")
+        st.write("**Module Permissions**")
+        p_cols = st.columns(4)
+        shrink_perm = p_cols[0].checkbox("Shrinkage", value=current_user_data.get('can_view_shrinkage', 'no') == 'yes')
+        volume_perm = p_cols[1].checkbox("Volume", value=current_user_data.get('can_view_volume', 'no') == 'yes')
+        capacity_perm = p_cols[2].checkbox("Capacity", value=current_user_data.get('can_view_capacity', 'no') == 'yes')
+        schedule_perm = p_cols[3].checkbox("Schedules", value=current_user_data.get('can_manage_schedules', 'no') == 'yes')
+
+        submitted = st.form_submit_button("Save User")
+        
+        if submitted:
+            if is_new_user:
+                if username and password:
+                    if add_user(username, password, role, {'can_view_shrinkage': shrink_perm, 'can_view_volume': volume_perm, 'can_view_capacity': capacity_perm, 'can_manage_schedules': schedule_perm}):
+                        st.success(f"User '{username}' added successfully!")
+                        st.cache_data.clear()
+                        st.rerun()
+                    else:
+                        st.error("Username already exists.")
+                else:
+                    st.error("Username and password are required for a new user.")
+            else:
+                update_user(selected_user, password if password else None, role, {'can_view_shrinkage': shrink_perm, 'can_view_volume': volume_perm, 'can_view_capacity': capacity_perm, 'can_manage_schedules': schedule_perm})
+                st.success(f"User '{selected_user}' updated successfully!")
+                st.cache_data.clear()
+                st.rerun()
+    
+    if not users_df.empty:
+        st.subheader("Delete User")
+        with st.form("delete_user_form"):
+            user_to_delete = st.selectbox("Select a user to delete:", options=users_df['username'].unique())
+            if st.form_submit_button("Delete User", type="primary"):
+                if user_to_delete == st.session_state['username']:
+                    st.error("You cannot delete your own account.")
+                else:
+                    delete_user(user_to_delete)
+                    st.warning(f"User '{user_to_delete}' deleted.")
+                    st.cache_data.clear()
+                    st.rerun()
+
+def render_logs_on_admin_tab():
+    st.header("📜 System & Job History")
+    
+    history_df = get_run_history()
+    if not history_df.empty:
+        st.dataframe(history_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No jobs have been run yet.")
+
+
+
+
+# --- SECTION 8: MAIN APP EXECUTION ---
+
+
+if __name__ == "__main__":
+    create_db_tables()
+    initialize_session_state()
+    
+    # Check if any users exist. If not, prompt to create an admin user first.
+    if not get_all_users().empty:
+        if not check_password():
+            st.stop()
+    else:
+        st.warning("No users found. Please create an initial Admin user.")
+        with st.form("initial_admin_setup"):
+            st.subheader("Create Initial Admin User")
+            username = st.text_input("Admin Username")
+            password = st.text_input("Admin Password", type="password")
+            if st.form_submit_button("Create User"):
+                if username and password:
+                    add_user(username, password, 'Admin', {'can_view_shrinkage': 1, 'can_view_volume': 1, 'can_view_capacity': 1, 'can_manage_schedules': 1})
+                    st.success("Admin user created! Please refresh and log in.")
+                    time.sleep(2)
+                    st.rerun()
+                else:
+                    st.error("Username and password cannot be empty.")
+        st.stop()
+
+    # --- Sidebar ---
+    with st.sidebar:
+        st.header("🛠️ Controls")
+        st.info(f"Logged in as: **{st.session_state.get('username', '')}**")
+        if st.button("Logout"):
+            # Clear all session state keys to ensure a clean logout
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+        
+        st.markdown("---")
+
+    # --- Main Page Header ---
+    logo_col, title_col, refresh_col = st.columns([0.6, 0.2, 0.2])
+    with logo_col:
+        st.image("https://i.postimg.cc/vmwmF50z/Remove-background-project.png", width=350)
+    with refresh_col:
+        st.write("#")
+        if st.button("Refresh 🔄", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+    current_day = datetime.now().strftime("%A")
+    st.markdown(f"**Happy {current_day}!** Hey **{st.session_state.get('username', 'User')}**, ready to forecast the future?")
+    st.markdown("Welcome to the all-in-one Workforce Management tool. Select a module below to get started.")
+    st.markdown("---")   
+    
+    # --- Dynamic Tab Creation based on Permissions ---
+    allowed_tabs = []
+    tab_render_map = {
+        "👥 Shrinkage": render_shrinkage_forecast_tab,
+        "📦 Volume": render_volume_forecast_tab,
+        "🗓️ Monthly Planner": render_monthly_capacity_planner_tab,
+        "⚙️ Capacity Modeler": render_capacity_planning_tab,
+        "👤 Admin": render_admin_tab
+    }
+
+    if str(st.session_state.get("can_view_shrinkage")).lower() == 'yes':
+        allowed_tabs.append("👥 Shrinkage")
+    if str(st.session_state.get("can_view_volume")).lower() == 'yes':
+        allowed_tabs.append("📦 Volume")
+    if str(st.session_state.get("can_view_capacity")).lower() == 'yes':
+        allowed_tabs.append("🗓️ Monthly Planner")
+        allowed_tabs.append("⚙️ Capacity Modeler")
+    if st.session_state.get('role', '').lower() == 'admin':
+        allowed_tabs.append("👤 Admin")
+        
+    if not allowed_tabs:
+        st.warning("Your user role has no modules enabled. Please contact an administrator.")
+    else:
+        created_tabs = st.tabs(allowed_tabs)
+        for i, tab_title in enumerate(allowed_tabs):
+            with created_tabs[i]:
+                if tab_title == "👤 Admin":
+                    render_admin_tab()
+                    st.markdown("---")
+                    render_logs_on_admin_tab()
+                else:
+                    # This will call the correct render function for the tab
+                    tab_render_map[tab_title]()
+
+    st.markdown("---")
+    st.markdown("<footer style='text-align:center;color:#94a3b8;'>Powered by PayOps WFM | One App to Rule Them All</footer>", unsafe_allow_html=True)
